@@ -1007,6 +1007,7 @@ dependencies = [
  "anyhow",
  "dirs 7.0.0",
  "gpui",
+ "serde_json",
 ]
 
 [[package]]

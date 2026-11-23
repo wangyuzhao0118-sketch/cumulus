@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
+use crate::workflow::{self, Plan};
 use crate::remote::{self, Ssh, Usage, fmt_bytes, sh_quote};
 
 const BOOT_SH: &str = include_str!("../kit/boot.sh");
@@ -167,6 +168,8 @@ pub struct State {
     pub drive_auth_url: Option<String>,
     pub drive_ok: bool,
     pub log: VecDeque<String>,
+    /// 一共写过多少行日志（命令行按它增量取日志）
+    pub log_seq: u64,
     pub comfy_log: Vec<String>,
     pub outputs: Vec<Output>,
     pub syncing: Option<String>,
@@ -174,6 +177,11 @@ pub struct State {
     pub models: Vec<Model>,
     pub models_loading: bool,
     pub models_error: Option<String>,
+    /// ComfyUI 里保存的工作流（相对路径, 修改时间），None = 还没读
+    pub workflows: Option<Result<Vec<(String, f64)>, String>>,
+    /// 「从工作流导入 SSD」的预览：(工作流名字, 结果)；None + wf_busy 表示正在分析
+    pub wf_plan: Option<(String, Result<Plan, String>)>,
+    pub wf_busy: bool,
     pub notices: Vec<(String, bool)>,
     /// 自动关机的原因（关机后在界面上显示）
     pub auto_stopped: Option<String>,
@@ -259,6 +267,7 @@ impl Engine {
         let l = line.into();
         self.edit(|s| {
             s.log.push_back(l);
+            s.log_seq += 1;
             while s.log.len() > 3000 {
                 s.log.pop_front();
             }
@@ -971,7 +980,7 @@ impl Engine {
         let e = self.clone();
         std::thread::spawn(move || {
             let cmd = format!(
-                "mkdir -p {r}; cd {r} && for d in */; do echo \"dir ${{d%/}}\"; done; find -L . -mindepth 2 -maxdepth 3 -type f ! -name '.*' -printf 'f %P\\t%s\\n' 2>/dev/null; {ssd}",
+                "mkdir -p {r}; cd {r} && for d in */; do echo \"dir ${{d%/}}\"; done; find -L . -mindepth 2 -maxdepth 3 -type f ! -name '.*' ! -name 'put_*_here' -printf 'f %P\\t%s\\n' 2>/dev/null; {ssd}",
                 r = sh_quote(&root),
                 ssd = SSD_LIST
             );
@@ -1001,10 +1010,10 @@ impl Engine {
     }
 
     /// 在 VM 上把模型下载到 models/<类别>/（接了 Drive 就是 Drive 上，永久保存）
-    pub fn download_model(&self, url: String, category: String, name: String) {
+    pub fn download_model(&self, url: String, category: String, name: String) -> Option<u64> {
         let Some(ssh) = self.ssh() else {
             self.notify("开机后才能下载模型", true);
-            return;
+            return None;
         };
         let cfg = self.config();
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
@@ -1034,6 +1043,7 @@ impl Engine {
                 e.load_models();
             }
         });
+        Some(id)
     }
 
     /// 在 VM 上跑一个带 @@NAME / @@DL / @@DONE / @@FAIL 输出的任务，把进度写进对应的 Download。
@@ -1226,6 +1236,115 @@ impl Engine {
         });
     }
 
+    // ------------------------------------------------------------ 从工作流导入 SSD
+
+    /// 读出 ComfyUI 里保存的工作流列表（接了 Drive 就是 Drive 上的 workflows/）
+    pub fn load_workflows(&self) {
+        let e = self.clone();
+        std::thread::spawn(move || {
+            let _ = e.workflows_now();
+        });
+    }
+
+    /// 同步读工作流列表（同时更新 State::workflows）
+    pub fn workflows_now(&self) -> Result<Vec<(String, f64)>, String> {
+        let r = match self.ssh() {
+            Some(ssh) => list_workflows(&ssh, &self.config().workflows_dir()),
+            None => Err("没有连接 VM".into()),
+        };
+        self.edit(|s| s.workflows = Some(r.clone()));
+        r
+    }
+
+    /// 读 VM 上保存的一个工作流（相对 workflows 目录）
+    pub fn read_workflow(&self, rel: &str) -> anyhow::Result<String> {
+        let ssh = self.ssh().ok_or_else(|| anyhow::anyhow!("没有连接 VM"))?;
+        if rel.split('/').any(|x| x == "..") {
+            anyhow::bail!("工作流名字不对：{rel}");
+        }
+        let path = format!("{}/{}", self.config().workflows_dir(), rel);
+        ssh.run(&format!("cat -- {}", sh_quote(&path)), None, Duration::from_secs(60))
+    }
+
+    /// 模型列表没读过就读一遍（阻塞，后台线程里用）
+    pub fn ensure_models(&self) -> anyhow::Result<()> {
+        if self.state().models.is_empty() {
+            self.load_models();
+            std::thread::sleep(Duration::from_millis(200));
+            let t = Instant::now();
+            while self.state().models_loading && t.elapsed() < Duration::from_secs(150) {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+        match self.state().models_error.clone() {
+            Some(e) => anyhow::bail!("读取模型列表失败：{e}"),
+            None => Ok(()),
+        }
+    }
+
+    /// 分析工作流用到的模型，和 Drive 上的对上（阻塞）
+    pub fn plan_workflow(&self, text: &str) -> anyhow::Result<Plan> {
+        let wf: serde_json::Value = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("不是合法的 JSON 工作流：{e}"))?;
+        let refs = workflow::refs(&wf);
+        if refs.is_empty() {
+            anyhow::bail!("这个工作流里没有找到模型文件");
+        }
+        self.ensure_models()?;
+        let selected = self.config().ssd_models;
+        Ok(workflow::plan(&refs, &self.state().models, &selected))
+    }
+
+    /// 界面用：在后台分析，结果放进 State::wf_plan。source 是界面上显示的名字；
+    /// text 为 None 时从 VM 的 workflows 目录读 source
+    pub fn preview_workflow(&self, source: String, text: Option<String>) {
+        self.edit(|s| {
+            s.wf_plan = None;
+            s.wf_busy = true;
+        });
+        let e = self.clone();
+        std::thread::spawn(move || {
+            let r = match text {
+                Some(t) => Ok(t),
+                None => e.read_workflow(&source),
+            }
+            .and_then(|t| e.plan_workflow(&t))
+            .map_err(|err| err.to_string());
+            e.edit(|s| {
+                s.wf_busy = false;
+                s.wf_plan = Some((source, r));
+            });
+        });
+    }
+
+    /// 把计划里还不在 SSD 上的模型全部勾选并开始复制。空间不够时报错，什么也不做。
+    /// 返回新开始复制的任务编号
+    pub fn apply_plan(&self, plan: &Plan) -> anyhow::Result<Vec<u64>> {
+        let (busy, free) = {
+            let s = self.state();
+            let busy: HashSet<String> = s.downloads.iter().filter(|d| d.to_ssd && d.active()).map(|d| format!("{}/{}", d.category, d.name)).collect();
+            (busy, s.disk.1.saturating_sub(s.disk.0))
+        };
+        let todo: Vec<&(String, u64, bool, bool)> = plan.to_copy().filter(|f| !busy.contains(&f.0)).collect();
+        let need: u64 = todo.iter().map(|f| f.1).sum();
+        let pending: u64 = self.state().downloads.iter().filter(|d| d.to_ssd && d.active()).map(|d| d.total.saturating_sub(d.done)).sum();
+        if free > 0 && need + pending + (3 << 30) > free {
+            anyhow::bail!("本地 SSD 空间不够：要复制 {}（加上正在复制的 {}），只剩 {}", fmt_bytes(need), fmt_bytes(pending), fmt_bytes(free));
+        }
+        for (key, ..) in &todo {
+            if let Some((cat, name)) = key.split_once('/') {
+                self.ssd_select(cat, name, true);
+            }
+        }
+        let keys: HashSet<&str> = todo.iter().map(|f| f.0.as_str()).collect();
+        Ok(self
+            .state()
+            .downloads
+            .iter()
+            .filter(|d| d.to_ssd && d.active() && keys.contains(format!("{}/{}", d.category, d.name).as_str()))
+            .map(|d| d.id)
+            .collect())
+    }
+
     fn copy_to_ssd(&self, category: String, name: String) {
         let Some(ssh) = self.ssh() else { return };
         let busy = self.state().downloads.iter().any(|d| d.to_ssd && d.active() && d.category == category && d.name == name);
@@ -1307,6 +1426,20 @@ fn regex_escape(s: &str) -> String {
         o.push(c);
     }
     o
+}
+
+fn list_workflows(ssh: &Ssh, dir: &str) -> Result<Vec<(String, f64)>, String> {
+    let cmd = format!("cd {} 2>/dev/null && find . -type f -name '*.json' ! -name '.*' -printf '%T@\\t%P\\n'; true", sh_quote(dir));
+    let out = ssh.run(&cmd, None, Duration::from_secs(60)).map_err(|e| e.to_string())?;
+    let mut list: Vec<(String, f64)> = out
+        .lines()
+        .filter_map(|l| {
+            let (t, p) = l.split_once('\t')?;
+            Some((p.to_string(), t.parse().unwrap_or(0.0)))
+        })
+        .collect();
+    list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(list)
 }
 
 /// 列出 SSD 上已经复制好的模型：每行 "s 类别/文件名"

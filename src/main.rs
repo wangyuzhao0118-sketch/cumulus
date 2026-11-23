@@ -1,9 +1,12 @@
 #[allow(dead_code)]
 mod anim;
+mod cli;
 mod config;
+mod control;
 mod engine;
 mod input;
 mod remote;
+mod workflow;
 #[allow(dead_code)]
 mod theme;
 
@@ -108,6 +111,8 @@ struct Cumulus {
     dl_category: String,
     model_cat: Option<String>,
     confirm_delete: Option<(String, String)>,
+    /// 「从工作流导入 SSD」面板是否展开
+    wf_open: bool,
     comfy_log_tab: bool,
     log_scroll: UniformListScrollHandle,
     log_follow: bool,
@@ -238,6 +243,7 @@ impl Cumulus {
             dl_category: "checkpoints".into(),
             model_cat: None,
             confirm_delete: None,
+            wf_open: false,
             comfy_log_tab: false,
             log_scroll: UniformListScrollHandle::new(),
             log_follow: true,
@@ -321,18 +327,9 @@ impl Cumulus {
     /// 退出程序但让 VM 继续跑：起一个后台守护进程，继续负责自动关机和出图同步
     fn quit_keep_running(&mut self, cx: &mut Context<Self>) {
         self.engine.shutdown_local();
-        if let Ok(exe) = std::env::current_exe() {
-            use std::os::unix::process::CommandExt;
-            let log = std::fs::File::create(config::dir().join("guard.log")).ok();
-            let mut c = std::process::Command::new(exe);
-            c.arg("--guard").stdin(std::process::Stdio::null()).process_group(0);
-            if let Some(l) = log {
-                if let Ok(l2) = l.try_clone() {
-                    c.stdout(l).stderr(l2);
-                }
-            }
-            let _ = c.spawn();
-        }
+        // 先让出控制接口，守护进程才能接手（命令行之后找它）
+        let _ = std::fs::remove_file(control::sock_path());
+        let _ = control::spawn_guard();
         cx.quit();
     }
 
@@ -381,6 +378,126 @@ impl Cumulus {
             self.toast(if busy { "已保存。Drive、节点、启动参数下次开机生效；自动关机规则立即生效" } else { "已保存" }, false);
         }
         cx.notify();
+    }
+
+    /// 选本机的工作流文件分析
+    fn pick_workflow_file(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("分析".into()) });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else { return };
+            let Some(p) = paths.into_iter().next() else { return };
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let text = std::fs::read_to_string(&p);
+            let _ = this.update(cx, |app, cx| {
+                match text {
+                    Ok(t) => app.engine.preview_workflow(name, Some(t)),
+                    Err(e) => app.toast(format!("读不了 {name}：{e}"), true),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 「从工作流导入 SSD」面板：选工作流 → 预览要复制 / 缺少的模型 → 一键复制
+    fn render_wf_import(&self, s: &engine::State, cx: &mut Context<Self>) -> gpui::Div {
+        let mut panel = div().mt_1().p_3().rounded_md().border_1().border_color(theme::border()).flex().flex_col().gap_2().child(
+            div().flex().items_center().gap_2()
+                .child(div().flex_1().text_xs().text_color(theme::muted()).child("选一个工作流，把它用到的模型都复制到 SSD"))
+                .child(button("wf-file", "本机文件…", true).on_click(cx.listener(|this, _, _, cx| this.pick_workflow_file(cx))))
+                .child(button("wf-reload", "刷新", true).on_click(cx.listener(|this, _, _, cx| {
+                    this.engine.load_workflows();
+                    cx.notify();
+                }))),
+        );
+        // ComfyUI 里保存的工作流（最新的在前）
+        panel = match &s.workflows {
+            None => panel.child(label("读取 ComfyUI 里保存的工作流…")),
+            Some(Err(e)) => panel.child(label(format!("读取工作流失败：{e}"))),
+            Some(Ok(list)) if list.is_empty() => panel.child(label("ComfyUI 里还没有保存的工作流，可以选本机文件。")),
+            Some(Ok(list)) => {
+                let current = s.wf_plan.as_ref().map(|p| p.0.clone());
+                panel.child(div().flex().flex_wrap().gap_1p5().children(list.iter().take(40).enumerate().map(|(i, (name, _))| {
+                    let n = name.clone();
+                    let shown = name.trim_end_matches(".json").to_string();
+                    chip(("wf", i), shown, current.as_deref() == Some(name.as_str()), true).on_click(cx.listener(move |this, _, _, cx| {
+                        this.engine.preview_workflow(n.clone(), None);
+                        cx.notify();
+                    }))
+                })))
+            }
+        };
+        if s.wf_busy {
+            return panel.child(label("分析中…"));
+        }
+        let Some((name, res)) = &s.wf_plan else { return panel };
+        let plan = match res {
+            Err(e) => return panel.child(div().text_xs().text_color(theme::bad()).child(format!("{name}：{e}"))),
+            Ok(p) => p.clone(),
+        };
+        let copying: std::collections::HashSet<String> =
+            s.downloads.iter().filter(|d| d.to_ssd && d.active()).map(|d| format!("{}/{}", d.category, d.name)).collect();
+        let todo = plan.to_copy().filter(|f| !copying.contains(&f.0)).count();
+        let todo_bytes: u64 = plan.to_copy().filter(|f| !copying.contains(&f.0)).map(|f| f.1).sum();
+        panel = panel.child(
+            div().pt_1().text_sm().font_weight(FontWeight::MEDIUM).child(format!(
+                "{name}：用到 {} 个模型{}",
+                plan.found.len() + plan.missing.len(),
+                if plan.missing.is_empty() { String::new() } else { format!("，Drive 上缺 {} 个", plan.missing.len()) }
+            )),
+        );
+        let row = || div().flex().items_center().gap_3().py_1().border_t_1().border_color(theme::border());
+        for (i, (key, size, on_ssd, _)) in plan.found.iter().enumerate() {
+            let (text, color) = if *on_ssd {
+                ("已在 SSD", theme::ok())
+            } else if copying.contains(key) {
+                ("复制中", theme::accent())
+            } else {
+                ("将复制", theme::muted())
+            };
+            panel = panel.child(
+                row()
+                    .id(("wff", i))
+                    .child(div().flex_1().min_w(px(0.)).text_xs().overflow_hidden().whitespace_nowrap().text_ellipsis().child(key.clone()))
+                    .child(div().w(px(70.)).text_xs().text_color(theme::muted()).text_right().child(fmt_bytes(*size)))
+                    .child(div().w(px(56.)).text_xs().text_color(color).text_right().child(text)),
+            );
+        }
+        for (i, m) in plan.missing.iter().enumerate() {
+            let dl = match (&m.url, &m.dir) {
+                (Some(u), Some(d)) => {
+                    let (u, d) = (u.clone(), d.clone());
+                    Some(button(("wfdl", i), format!("下载到 {d}"), true).on_click(cx.listener(move |this, _, _, cx| {
+                        this.engine.download_model(u.clone(), d.clone(), String::new());
+                        this.toast("已开始下载，下完后再点一次这个工作流就能复制到 SSD", false);
+                        cx.notify();
+                    })))
+                }
+                _ => None,
+            };
+            panel = panel.child(
+                row()
+                    .child(div().flex_1().min_w(px(0.)).text_xs().text_color(theme::warn()).overflow_hidden().whitespace_nowrap().text_ellipsis().child(format!("缺少 {}", m.name)))
+                    .child(label(m.node.clone()))
+                    .children(dl),
+            );
+        }
+        let free = s.disk.1.saturating_sub(s.disk.0);
+        panel.child(
+            div().flex().items_center().gap_2().pt_1()
+                .child(div().flex_1().text_xs().text_color(theme::faint()).child(if s.disk.1 > 0 { format!("SSD 剩余 {}", fmt_bytes(free)) } else { String::new() }))
+                .child(if todo > 0 {
+                    primary("wf-apply", format!("复制 {todo} 个到 SSD（{}）", fmt_bytes(todo_bytes)), theme::accent()).on_click(cx.listener(move |this, _, _, cx| {
+                        match this.engine.apply_plan(&plan) {
+                            Ok(ids) => this.toast(format!("开始复制 {} 个模型到 SSD", ids.len().max(todo)), false),
+                            Err(e) => this.toast(e.to_string(), true),
+                        }
+                        cx.notify();
+                    }))
+                } else {
+                    button("wf-apply", if plan.found.is_empty() { "Drive 上没有对应的模型" } else { "都已在 SSD 或正在复制" }, false)
+                }),
+        )
     }
 
     fn submit_download(&mut self, cx: &mut Context<Self>) {
@@ -901,6 +1018,16 @@ impl Cumulus {
                                 this.engine.ssd_sync();
                                 cx.notify();
                             })))
+                        })
+                        .when(running, |d| {
+                            let open = self.wf_open;
+                            d.child(chip("wf-open", "从工作流导入…", open, true).on_click(cx.listener(move |this, _, _, cx| {
+                                this.wf_open = !open;
+                                if this.wf_open {
+                                    this.engine.load_workflows();
+                                }
+                                cx.notify();
+                            })))
                         }),
                 )
                 .child(label(
@@ -911,6 +1038,7 @@ impl Cumulus {
                     .child(format!("已选 {} 个 · {}", chosen.len(), fmt_bytes(sel_bytes)))
                     .child(format!("已就绪 {} 个", ready))
                     .when(s.disk.1 > 0, |d| d.child(format!("SSD 剩余 {}", fmt_bytes(free)))))
+                .when(running && self.wf_open, |d| d.child(self.render_wf_import(&s, cx)))
         });
         let list = card()
             .gap_3()
@@ -1399,13 +1527,19 @@ impl Render for Cumulus {
     }
 }
 
-/// 无界面的守护模式：主程序退出但 VM 还在跑时，继续负责自动关机和出图同步
+/// 无界面的守护模式：主程序退出但 VM 还在跑时，或者命令行在没开窗口时被调用，
+/// 由它掌管 VM：自动关机、出图同步、响应命令行。VM 关着且 2 分钟没有命令就退出
 fn guard() {
     let pidf = config::dir().join("guard.pid");
-    let _ = std::fs::write(&pidf, std::process::id().to_string());
     let engine = Engine::new(Config::load());
+    if let Err(e) = control::serve(engine.clone(), "guard") {
+        println!("不启动：{e}");
+        return;
+    }
+    let _ = std::fs::write(&pidf, std::process::id().to_string());
     engine.check_existing();
     let mut last = String::new();
+    let mut off_since: Option<Instant> = None;
     loop {
         std::thread::sleep(Duration::from_secs(5));
         // 主程序重新打开时会改写 pid 文件，让出控制权
@@ -1423,10 +1557,16 @@ fn guard() {
             last = log;
         }
         if matches!(phase, Phase::Off | Phase::Failed(_)) {
-            println!("结束：{}", phase.label());
-            engine.shutdown_local();
-            let _ = std::fs::remove_file(&pidf);
-            return;
+            let since = *off_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > Duration::from_secs(120) && control::idle_secs() > 120 {
+                println!("结束：{}", phase.label());
+                engine.shutdown_local();
+                let _ = std::fs::remove_file(&pidf);
+                let _ = std::fs::remove_file(control::sock_path());
+                return;
+            }
+        } else {
+            off_since = None;
         }
     }
 }
@@ -1614,6 +1754,19 @@ fn selftest(keep: bool) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(cmd) = args.get(1) {
+        if cli::COMMANDS.contains(&cmd.as_str()) {
+            std::process::exit(cli::main(&args[1..]));
+        }
+        if cmd == "--help" || cmd == "-h" {
+            std::process::exit(cli::main(&["help".to_string()]));
+        }
+        // 不是 - 开头的参数都当命令；不认识就报错，而不是打开窗口
+        if !cmd.starts_with('-') {
+            eprintln!("不认识的命令：{cmd}（cumulus help 查看用法）");
+            std::process::exit(2);
+        }
+    }
     if args.get(1).map(String::as_str) == Some("--guard") {
         return guard();
     }
@@ -1624,6 +1777,10 @@ fn main() {
     let cfg = Config::load();
     theme::set(&cfg.theme);
     let engine = Engine::new(cfg);
+    // 命令行（cumulus status 等）经这个接口操作窗口里的同一个引擎
+    if let Err(e) = control::serve(engine.clone(), "app") {
+        eprintln!("控制接口没有启动：{e}");
+    }
     engine.check_existing();
     let start_page = args.iter().position(|a| a == "--page").and_then(|i| args.get(i + 1)).map(|s| Page::from_key(s));
 

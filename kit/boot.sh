@@ -92,6 +92,11 @@ done <<< "${CUSTOM_NODES:-}"
 
 stage config "配置模型目录"
 ARGS=(--listen 127.0.0.1 --port 8188 --disable-auto-launch)
+# 没有 GPU（选了 CPU）时 ComfyUI 默认找 CUDA 会直接退出
+if ! nvidia-smi -L >/dev/null 2>&1; then
+  echo "没有 GPU，以 CPU 模式运行 ComfyUI"
+  ARGS+=(--cpu)
+fi
 if [ -n "$DRIVE_ROOT" ] && [ -d "$DRIVE_ROOT" ]; then
   echo "Drive 目录：$DRIVE_ROOT"
   if [ -d "$DRIVE_ROOT/models" ]; then

@@ -60,6 +60,10 @@ impl Default for Config {
 }
 
 pub fn dir() -> PathBuf {
+    // 测试或多套设置时可以另指一个目录（里面的会话名不同，就不会碰到正在用的 VM）
+    if let Some(d) = std::env::var_os("CUMULUS_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
     let base = dirs::config_dir().unwrap_or_else(std::env::temp_dir);
     let d = base.join("cumulus");
     migrate(&base.join("nimbus"), &d);
@@ -169,6 +173,15 @@ impl Config {
     /// 选中的模型能不能放 SSD（只有接了 Drive 才有意义）
     pub fn ssd_enabled(&self) -> bool {
         self.mount_drive
+    }
+
+    /// ComfyUI 保存工作流的目录（接了 Drive 时 boot.sh 把它链接到 Drive 上）
+    pub fn workflows_dir(&self) -> String {
+        if self.mount_drive {
+            format!("{}/workflows", self.drive_root.trim_end_matches('/'))
+        } else {
+            "/content/ComfyUI/user/default/workflows".into()
+        }
     }
 
     pub fn models_root(&self) -> String {
