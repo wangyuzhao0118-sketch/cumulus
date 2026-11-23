@@ -1,0 +1,10 @@
+[package]
+name = "cumulus"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "7.0.0"
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
