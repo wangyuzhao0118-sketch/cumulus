@@ -6,6 +6,14 @@ Colab 上 ComfyUI 的 macOS 原生客户端（Rust + GPUI）。一键在 Google 
 
 ## 运行
 
+**直接下载**：在 [Releases](https://github.com/wangyuzhao0118-sketch/cumulus/releases) 下载 `Cumulus-<版本>-macos-arm64.zip`（Apple Silicon，macOS 11+），解压后把 Cumulus.app 拖进「应用程序」。应用没有经过 Apple 公证，第一次打开会被拦下，先运行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Cumulus.app
+```
+
+**自己编译**：
+
 ```bash
 ./bundle.sh                 # 编译并生成 target/Cumulus.app
 open target/Cumulus.app

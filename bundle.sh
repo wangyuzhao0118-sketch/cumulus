@@ -2,6 +2,8 @@
 # 编译 release 版并打包成 Cumulus.app（有 assets/AppIcon.icns 时一起打进去）
 set -euo pipefail
 cd "$(dirname "$0")"
+# 把编译路径里的本机用户名、目录换掉，发出去的二进制不带这些
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup --remap-path-prefix=$(pwd)=/cumulus"
 cargo build --release
 APP="target/Cumulus.app"
 rm -rf "$APP"
