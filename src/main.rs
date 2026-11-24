@@ -85,6 +85,7 @@ struct Inputs {
     civitai_token: Entity<TextInput>,
     dl_url: Entity<TextInput>,
     dl_name: Entity<TextInput>,
+    profile_name: Entity<TextInput>,
 }
 
 struct Notice {
@@ -113,6 +114,8 @@ struct Cumulus {
     confirm_delete: Option<(String, String)>,
     /// 「从工作流导入 SSD」面板是否展开
     wf_open: bool,
+    /// 切换方案会删掉 SSD 上的模型时，先问一下
+    confirm_profile: Option<String>,
     comfy_log_tab: bool,
     log_scroll: UniformListScrollHandle,
     log_follow: bool,
@@ -195,6 +198,24 @@ fn phase_color(p: &Phase) -> Hsla {
     }
 }
 
+/// 「12.3 GB / 可放约 180 GB」
+fn budget_label(b: &engine::Budget) -> String {
+    let mut t = fmt_bytes(b.bytes);
+    if b.unknown > 0 {
+        t.push_str(&format!("（{} 个大小未知）", b.unknown));
+    }
+    match b.room {
+        Some(r) => {
+            t.push_str(&format!(" / SSD 可放约 {}", fmt_bytes(r.saturating_sub(engine::SSD_RESERVE))));
+            if !b.fits() {
+                t.push_str("，放不下");
+            }
+        }
+        None => t.push_str("（这种 GPU 的 SSD 还没量过，开一次机就知道）"),
+    }
+    t
+}
+
 fn open_path(p: &std::path::Path) {
     let _ = std::process::Command::new("/usr/bin/open").arg(p).spawn();
 }
@@ -221,6 +242,7 @@ impl Cumulus {
             civitai_token: mk("（可选）", &cfg.civitai_token, cx),
             dl_url: mk("粘贴 Hugging Face / Civitai / 直链地址", "", cx),
             dl_name: mk("文件名（可选，默认自动识别）", "", cx),
+            profile_name: mk("方案名，如「视频 Wan」", "", cx),
         };
         // 定时看一下引擎状态有没有变化；开机中、运行中每秒刷新一次（倒计时、计时器）
         let ticker = cx.spawn(async move |this, cx| {
@@ -244,6 +266,7 @@ impl Cumulus {
             model_cat: None,
             confirm_delete: None,
             wf_open: false,
+            confirm_profile: None,
             comfy_log_tab: false,
             log_scroll: UniformListScrollHandle::new(),
             log_follow: true,
@@ -483,9 +506,20 @@ impl Cumulus {
             );
         }
         let free = s.disk.1.saturating_sub(s.disk.0);
+        let keys: Vec<String> = plan.found.iter().map(|f| f.0.clone()).collect();
+        let pname = name.rsplit('/').next().unwrap_or(name).trim_end_matches(".json").to_string();
         panel.child(
             div().flex().items_center().gap_2().pt_1()
                 .child(div().flex_1().text_xs().text_color(theme::faint()).child(if s.disk.1 > 0 { format!("SSD 剩余 {}", fmt_bytes(free)) } else { String::new() }))
+                .when(!keys.is_empty(), |d| {
+                    d.child(button("wf-save", "存为方案", true).on_click(cx.listener(move |this, _, _, cx| {
+                        match this.engine.profile_save(&pname, keys.clone()) {
+                            Ok(()) => this.toast(format!("已存方案「{pname}」（{} 个模型），以后点一下就能整组换上", keys.len()), false),
+                            Err(e) => this.toast(e.to_string(), true),
+                        }
+                        cx.notify();
+                    })))
+                })
                 .child(if todo > 0 {
                     primary("wf-apply", format!("复制 {todo} 个到 SSD（{}）", fmt_bytes(todo_bytes)), theme::accent()).on_click(cx.listener(move |this, _, _, cx| {
                         match this.engine.apply_plan(&plan) {
@@ -497,6 +531,89 @@ impl Cumulus {
                 } else {
                     button("wf-apply", if plan.found.is_empty() { "Drive 上没有对应的模型" } else { "都已在 SSD 或正在复制" }, false)
                 }),
+        )
+    }
+
+    /// SSD 方案：点一下整组换上；把当前选择存成方案；删除当前方案
+    fn render_profiles(&self, profiles: &[(String, Vec<String>, engine::Budget, bool)], s: &engine::State, running: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let mut d = div().flex().flex_col().gap_2().pt_1().child(
+            div().flex().items_center().gap_1p5().flex_wrap()
+                .child(label("方案").mr_1())
+                .when(profiles.is_empty(), |d| d.child(label("还没有方案：在下面存当前选择，或在「从工作流导入」里存")))
+                .children(profiles.iter().enumerate().map(|(i, (name, keys, b, active))| {
+                    let n = name.clone();
+                    let active = *active;
+                    let text = format!("{}{name} · {} 个 · {}", if active { "✓ " } else { "" }, keys.len(), fmt_bytes(b.bytes));
+                    let mut c = chip(("prof", i), text, active, true);
+                    if !b.fits() {
+                        c = c.text_color(theme::warn());
+                    }
+                    c.on_click(cx.listener(move |this, _, _, cx| {
+                        if active {
+                            return;
+                        }
+                        // 开着时切换会删掉 SSD 上不在方案里的模型：先确认
+                        let removes = if this.engine.state().phase() == Phase::Running {
+                            let keys = this.engine.config().ssd_profiles.get(&n).cloned().unwrap_or_default();
+                            this.engine.state().models.iter().filter(|m| m.ssd && !keys.contains(&m.key())).count()
+                        } else {
+                            0
+                        };
+                        if removes > 0 && this.confirm_profile.as_deref() != Some(n.as_str()) {
+                            this.confirm_profile = Some(n.clone());
+                        } else {
+                            this.confirm_profile = None;
+                            this.engine.profile_use_bg(n.clone());
+                        }
+                        cx.notify();
+                    }))
+                })),
+        );
+        if let Some(n) = &self.confirm_profile {
+            let keys = profiles.iter().find(|p| p.0 == *n).map(|p| p.1.clone()).unwrap_or_default();
+            let removes = s.models.iter().filter(|m| m.ssd && !keys.contains(&m.key())).count();
+            let n2 = n.clone();
+            d = d.child(
+                div().flex().items_center().gap_2()
+                    .child(div().flex_1().text_xs().text_color(theme::warn()).child(format!("切换到「{n}」会从 SSD 删掉 {removes} 个不在方案里的模型（Drive 上的不动），腾出地方给方案里的")))
+                    .child(button("prof-yes", "确认切换", true).on_click(cx.listener(move |this, _, _, cx| {
+                        this.confirm_profile = None;
+                        this.engine.profile_use_bg(n2.clone());
+                        cx.notify();
+                    })))
+                    .child(button("prof-no", "取消", true).on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm_profile = None;
+                        cx.notify();
+                    }))),
+            );
+        }
+        let active = profiles.iter().find(|p| p.3).map(|p| p.0.clone());
+        let has_sel = !self.engine.config().ssd_models.is_empty();
+        d.child(
+            div().flex().items_center().gap_2()
+                .child(div().w(px(220.)).child(self.inputs.profile_name.clone()))
+                .child(button("prof-save", "把当前选择存为方案", has_sel).when(has_sel, |b| {
+                    b.on_click(cx.listener(|this, _, _, cx| {
+                        let name = this.inputs.profile_name.read(cx).text().trim().to_string();
+                        let keys = this.engine.config().ssd_models;
+                        match this.engine.profile_save(&name, keys) {
+                            Ok(()) => {
+                                this.toast(format!("已存方案「{name}」"), false);
+                                this.inputs.profile_name.update(cx, |t, cx| t.set_text(String::new(), None, cx));
+                            }
+                            Err(e) => this.toast(e.to_string(), true),
+                        }
+                        cx.notify();
+                    }))
+                }))
+                .when_some(active, |d, a| {
+                    d.child(button("prof-del", format!("删除方案「{a}」"), true).on_click(cx.listener(move |this, _, _, cx| {
+                        this.engine.profile_delete(&a);
+                        this.toast(format!("已删除方案「{a}」（SSD 上的模型不动）"), false);
+                        cx.notify();
+                    })))
+                })
+                .when(!running && !profiles.is_empty(), |d| d.child(label("关机时切换只改选择，开机后复制"))),
         )
     }
 
@@ -894,6 +1011,13 @@ impl Cumulus {
 
     fn render_models(&self, cx: &mut Context<Self>) -> AnyElement {
         let cfg = self.engine.config();
+        let sel_budget = self.engine.budget(&cfg.ssd_models);
+        let cur: std::collections::BTreeSet<&String> = cfg.ssd_models.iter().collect();
+        let profiles: Vec<(String, Vec<String>, engine::Budget, bool)> = cfg
+            .ssd_profiles
+            .iter()
+            .map(|(n, k)| (n.clone(), k.clone(), self.engine.budget(k), k.iter().collect::<std::collections::BTreeSet<_>>() == cur))
+            .collect();
         let s = self.engine.state();
         let running = s.phase() == Phase::Running;
         let mut cats: Vec<String> = s.models.iter().map(|m| m.category.clone()).collect();
@@ -998,7 +1122,6 @@ impl Cumulus {
         let copying: std::collections::HashMap<String, engine::Download> =
             s.downloads.iter().filter(|d| d.to_ssd && d.active()).map(|d| (format!("{}/{}", d.category, d.name), d.clone())).collect();
         let sizes: std::collections::HashMap<String, (u64, bool)> = s.models.iter().filter(|m| !m.name.is_empty()).map(|m| (m.key(), (m.size, m.ssd))).collect();
-        let sel_bytes: u64 = chosen.iter().filter_map(|k| sizes.get(k)).map(|x| x.0).sum();
         let ready = chosen.iter().filter(|k| sizes.get(*k).map(|x| x.1).unwrap_or(false)).count();
         let free = s.disk.1.saturating_sub(s.disk.0);
         let ssd_card = ssd_on.then(|| {
@@ -1010,6 +1133,12 @@ impl Cumulus {
                         .child(chip("ssd-auto", "开机自动传输", cfg.ssd_auto, true).on_click(cx.listener(|this, _, _, cx| {
                             let mut c = this.engine.config();
                             c.ssd_auto = !c.ssd_auto;
+                            this.engine.set_config(c);
+                            cx.notify();
+                        })))
+                        .child(chip("ssd-learn", "运行时自动复制", cfg.ssd_learn, true).on_click(cx.listener(|this, _, _, cx| {
+                            let mut c = this.engine.config();
+                            c.ssd_learn = !c.ssd_learn;
                             this.engine.set_config(c);
                             cx.notify();
                         })))
@@ -1032,12 +1161,19 @@ impl Cumulus {
                 )
                 .child(label(
                     "从 Drive 挂载目录读模型很慢（没缓存过的文件只有 35–50 MB/s）。勾选下面列表里的「SSD」，模型会复制到 VM 本地 SSD，ComfyUI 优先从 SSD 读。\
-                     直接走 Drive API 多连接下载（约 300 MB/s），同时复制 2 个文件。选择会记住，开机后自动重新复制；关机后 SSD 上的副本会清空，Drive 里的原文件不受影响。",
+                     直接走 Drive API 多连接下载（约 300 MB/s），同时复制 2 个文件。选择会记住；关机后 SSD 上的副本会清空，Drive 里的原文件不受影响。                     「运行时自动复制」：ComfyUI 开始跑工作流时，把它用到、还不在 SSD 上的模型复制过去，下次加载就快了。",
                 ))
-                .child(div().flex().gap_4().text_xs().text_color(theme::muted())
-                    .child(format!("已选 {} 个 · {}", chosen.len(), fmt_bytes(sel_bytes)))
-                    .child(format!("已就绪 {} 个", ready))
-                    .when(s.disk.1 > 0, |d| d.child(format!("SSD 剩余 {}", fmt_bytes(free)))))
+                .child(
+                    div().flex().gap_4().flex_wrap().text_xs().text_color(theme::muted())
+                        .child(
+                            div()
+                                .when(!sel_budget.fits(), |d| d.text_color(theme::warn()))
+                                .child(format!("已选 {} 个 · {}", chosen.len(), budget_label(&sel_budget))),
+                        )
+                        .when(running, |d| d.child(format!("已就绪 {ready} 个")))
+                        .when(s.disk.1 > 0, |d| d.child(format!("SSD 剩余 {}", fmt_bytes(free)))),
+                )
+                .child(self.render_profiles(&profiles, &s, running, cx))
                 .when(running && self.wf_open, |d| d.child(self.render_wf_import(&s, cx)))
         });
         let list = card()

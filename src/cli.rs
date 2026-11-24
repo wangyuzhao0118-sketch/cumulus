@@ -33,9 +33,10 @@ Cumulus 命令行 —— 在 Google Colab 上跑 ComfyUI
   logs [-n 50] [-f]          Cumulus 的运行日志；--comfy 看 ComfyUI 自己的日志
 
 出图
-  run <workflow.json|-> [--timeout 1800] [--no-wait]
+  run <workflow.json|-> [--timeout 1800] [--no-wait] [--no-ssd]
                              提交一个 API 格式的工作流（ComfyUI 里「导出 (API)」），
-                             等它跑完并同步回本机，打印本机文件路径
+                             等它跑完并同步回本机，打印本机文件路径。
+                             提交前先把它用到、还不在 SSD 上的模型复制过去（--no-ssd 跳过）
   interrupt                  中断 ComfyUI 正在跑的任务
   outputs [-n 20]            本机最近同步回来的出图
 
@@ -50,7 +51,12 @@ Cumulus 命令行 —— 在 Google Colab 上跑 ComfyUI
                              -（stdin），或 ComfyUI 里保存的工作流名字（见 workflows）；界面格式和 API 格式都行。
                              --dry-run 只列出会复制哪些、缺哪些
   ssd sync                   把选中但还没复制的补上
-  ssd list                   已选中放 SSD 的模型
+  ssd list                   已选中放 SSD 的模型，合计多大、SSD 放不放得下
+  ssd profile                SSD 方案（按工作流分组的一套模型），* 是当前用的
+  ssd profile save <名字> [--from <工作流>]
+                             把当前选择（或某个工作流用到的模型）存成方案
+  ssd profile use <名字>     切换方案：SSD 上只留方案里的模型，别的删掉腾地方，缺的复制
+  ssd profile rm <名字>      删除方案（不动 SSD 上的模型）
   rm-model <键> --yes        从 Drive 删除模型（进 Drive 回收站）
   tasks                      下载 / 复制任务；cancel <编号> 取消
   workflows                  ComfyUI 里保存的工作流（接了 Drive 就在 Drive 的 workflows/ 下）
@@ -74,6 +80,8 @@ struct Args {
     refresh: bool,
     yes: bool,
     dry_run: bool,
+    no_ssd: bool,
+    from: Option<String>,
     n: Option<usize>,
     gpu: Option<String>,
     name: Option<String>,
@@ -81,7 +89,7 @@ struct Args {
 }
 
 fn parse(args: &[String]) -> Result<Args> {
-    let mut a = Args { pos: vec![], json: false, no_wait: false, follow: false, comfy: false, refresh: false, yes: false, dry_run: false, n: None, gpu: None, name: None, timeout: None };
+    let mut a = Args { pos: vec![], json: false, no_wait: false, follow: false, comfy: false, refresh: false, yes: false, dry_run: false, no_ssd: false, from: None, n: None, gpu: None, name: None, timeout: None };
     let mut it = args.iter();
     while let Some(x) = it.next() {
         let mut val = |flag: &str| it.next().cloned().ok_or_else(|| anyhow!("{flag} 后面要跟一个值"));
@@ -93,6 +101,8 @@ fn parse(args: &[String]) -> Result<Args> {
             "--refresh" => a.refresh = true,
             "-y" | "--yes" => a.yes = true,
             "--dry-run" => a.dry_run = true,
+            "--no-ssd" => a.no_ssd = true,
+            "--from" => a.from = Some(val("--from")?),
             "-n" => a.n = Some(val("-n")?.parse().map_err(|_| anyhow!("-n 要跟数字"))?),
             "--gpu" => a.gpu = Some(val("--gpu")?),
             "--name" => a.name = Some(val("--name")?),
@@ -521,14 +531,138 @@ fn ssd(a: &Args) -> Result<i32> {
         "from" => ssd_from(a),
         "sync" => simple(a, json!({"cmd": "ssd_sync"}), "已把没复制的排进队列（cumulus tasks 查看）"),
         "list" => {
-            let v = call(json!({"cmd": "config_get"}))?;
-            let list: Vec<String> = v["config"]["ssd_models"].as_str().unwrap_or("").split('|').filter(|s| !s.is_empty()).map(String::from).collect();
-            let out = json!({"ok": true, "selected": list, "auto": v["config"]["ssd_auto"] == "1"});
-            emit(a, &out, || if list.is_empty() { "还没有选模型放 SSD".into() } else { list.join("\n") });
+            let v = call(json!({"cmd": "ssd_profiles"}))?;
+            emit(a, &v, || {
+                let list: Vec<&str> = v["selected"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                if list.is_empty() {
+                    return "还没有选模型放 SSD".into();
+                }
+                format!("{}\n共 {} 个，{}", list.join("\n"), list.len(), budget_text(&v["selected_budget"]))
+            });
             Ok(0)
         }
-        _ => bail!("用法：cumulus ssd add|rm|from|sync|list"),
+        "profile" => ssd_profile(a),
+        _ => bail!("用法：cumulus ssd add|rm|from|sync|list|profile"),
     }
+}
+
+/// 「12.3 GB，SSD 可放约 180 GB」
+fn budget_text(b: &Value) -> String {
+    let mut t = fmt_bytes(b["bytes"].as_u64().unwrap_or(0));
+    if let Some(n) = b["unknown_sizes"].as_u64().filter(|n| *n > 0) {
+        t.push_str(&format!("（另有 {n} 个不知道大小）"));
+    }
+    match b["room"].as_u64() {
+        Some(r) => {
+            let room = r.saturating_sub(crate::engine::SSD_RESERVE);
+            t.push_str(&format!("，SSD 可放约 {}", fmt_bytes(room)));
+            if b["fits"] == false {
+                t.push_str("，放不下");
+            }
+        }
+        None => t.push_str("，这种 GPU 的 SSD 容量还没量过（开一次机就知道）"),
+    }
+    t
+}
+
+fn ssd_profile(a: &Args) -> Result<i32> {
+    let sub = a.pos.get(1).map(String::as_str).unwrap_or("list");
+    let pname = a.pos.get(2);
+    let need_name = || pname.cloned().ok_or_else(|| anyhow!("用法：cumulus ssd profile {sub} <方案名>"));
+    match sub {
+        "list" => {
+            let v = call(json!({"cmd": "ssd_profiles"}))?;
+            emit(a, &v, || {
+                let ps = v["profiles"].as_array().cloned().unwrap_or_default();
+                if ps.is_empty() {
+                    return "还没有方案。cumulus ssd profile save <名字> 把当前选择存成方案，或加 --from <工作流>".into();
+                }
+                ps.iter()
+                    .map(|p| {
+                        format!(
+                            "{}{}  {} 个模型，{}",
+                            if p["active"] == true { "* " } else { "  " },
+                            p["name"].as_str().unwrap_or(""),
+                            p["models"].as_array().map(|m| m.len()).unwrap_or(0),
+                            budget_text(&p["budget"])
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+            Ok(0)
+        }
+        "save" => {
+            let n = need_name()?;
+            let mut req = json!({"cmd": "ssd_profile_save", "profile": n});
+            if let Some(src) = &a.from {
+                if src == "-" {
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    req["text"] = json!(s);
+                } else if Path::new(src).is_file() {
+                    req["text"] = json!(std::fs::read_to_string(src)?);
+                } else {
+                    req["name"] = json!(src);
+                }
+            }
+            let v = call(req)?;
+            let p = v["profiles"].as_array().into_iter().flatten().find(|p| p["name"] == n.as_str()).cloned().unwrap_or_default();
+            emit(a, &v, || {
+                let models: Vec<&str> = p["models"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                format!("已存方案「{n}」：{} 个模型，{}\n{}", models.len(), budget_text(&p["budget"]), models.join("\n"))
+            });
+            Ok(0)
+        }
+        "use" => {
+            let n = need_name()?;
+            let v = call(json!({"cmd": "ssd_profile_use", "profile": n}))?;
+            let ids: Vec<u64> = v["tasks"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+            if !a.json {
+                eprintln!("{}", v["message"].as_str().unwrap_or(""));
+            }
+            if ids.is_empty() || a.no_wait {
+                emit(a, &v, String::new);
+                return Ok(0);
+            }
+            let (ok, tasks) = wait_tasks(&ids)?;
+            Ok(report_tasks(a, ok, tasks))
+        }
+        "rm" => {
+            let n = need_name()?;
+            simple(a, json!({"cmd": "ssd_profile_rm", "profile": n}), &format!("已删除方案「{n}」（SSD 上的模型不动）"))
+        }
+        _ => bail!("用法：cumulus ssd profile list|save <名字> [--from <工作流>]|use <名字>|rm <名字>"),
+    }
+}
+
+/// 跑工作流前把它用到的模型复制到 SSD（等复制完再提交，第一次加载就快）。
+/// 放不下或出错只提示，照样从 Drive 读着跑
+fn prewarm(a: &Args, wf: &Value) -> Result<()> {
+    let s = call(json!({"cmd": "status"}))?;
+    if a.no_ssd || s["drive"]["enabled"] != true {
+        return Ok(());
+    }
+    let v = match call(json!({"cmd": "ssd_from_workflow", "text": wf.to_string(), "apply": true})) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("（没有预先复制到 SSD：{e}，这次从 Drive 读）");
+            return Ok(());
+        }
+    };
+    for m in v["missing"].as_array().into_iter().flatten() {
+        eprintln!("注意：Drive 上没有 {}（{}），工作流可能会报错", m["name"].as_str().unwrap_or(""), m["node"].as_str().unwrap_or(""));
+    }
+    let ids: Vec<u64> = v["tasks"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    eprintln!("先把 {} 个模型复制到 SSD（{}）…（不想等加 --no-ssd）", ids.len(), fmt_bytes(v["copy_bytes"].as_u64().unwrap_or(0)));
+    let (ok, _) = wait_tasks(&ids)?;
+    if !ok {
+        eprintln!("（有模型没复制成功，这次从 Drive 读）");
+    }
+    Ok(())
 }
 
 fn ssd_from(a: &Args) -> Result<i32> {
@@ -680,6 +814,7 @@ fn run_workflow(a: &Args) -> Result<i32> {
     let wf: Value = serde_json::from_str(&text).map_err(|e| anyhow!("{src} 不是合法的 JSON：{e}"))?;
     let body = prompt_body(wf)?;
     let port = comfy_port()?;
+    prewarm(a, &body["prompt"])?;
     let base = format!("http://127.0.0.1:{port}");
     let (code, resp) = http("POST", &format!("{base}/prompt"), Some(body.to_string().as_bytes()))?;
     let r: Value = serde_json::from_str(&resp).unwrap_or(json!({"raw": resp}));

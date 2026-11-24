@@ -2,7 +2,7 @@
 //!
 //! 所有耗时操作都在后台线程里做，结果写进共享的 `State`；界面定时读取 `State::version`，
 //! 变了就重绘。界面只调用这里的方法发指令，不直接碰 colab / ssh。
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin};
@@ -20,6 +20,8 @@ const DL_PY: &str = include_str!("../kit/dl.py");
 const CP_PY: &str = include_str!("../kit/cp.py");
 /// VM 本地 SSD 上的模型目录（boot.sh 把它排在 Drive 前面，同名模型优先从这里读）
 pub const SSD_ROOT: &str = "/content/cumulus_ssd";
+/// 往 SSD 复制时留出的余量（ComfyUI 运行、出图、临时文件要用）
+pub const SSD_RESERVE: u64 = 3 << 30;
 /// 同时复制到 SSD 的文件数。cp.py 走 Drive API 时一个文件就有约 300 MB/s，再多也快不了多少；
 /// 退回从挂载目录复制时（每个文件 35–50 MB/s）多几个会合计更快
 const SSD_PARALLEL: usize = 2;
@@ -177,6 +179,8 @@ pub struct State {
     pub models: Vec<Model>,
     pub models_loading: bool,
     pub models_error: Option<String>,
+    /// 见过的模型大小（类别/文件名 → 字节），存在本机，关机时也能估算 SSD 方案多大
+    pub known_sizes: HashMap<String, u64>,
     /// ComfyUI 里保存的工作流（相对路径, 修改时间），None = 还没读
     pub workflows: Option<Result<Vec<(String, f64)>, String>>,
     /// 「从工作流导入 SSD」的预览：(工作流名字, 结果)；None + wf_busy 表示正在分析
@@ -207,6 +211,39 @@ pub struct Engine {
     seq: Arc<AtomicU64>,
     /// 复制到 SSD 的并发名额
     ssd_slots: Arc<(Mutex<usize>, Condvar)>,
+    /// 已经检查过（自动预热过）的 ComfyUI 任务
+    warmed: Arc<Mutex<HashSet<String>>>,
+    warm_busy: Arc<AtomicBool>,
+}
+
+/// 一组模型放 SSD 要多大：bytes 是已知大小的合计，unknown 是不知道大小的个数，
+/// room 是能拿来放模型的 SSD 空间（开着时实测，关着时用这种 GPU 上次量的）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Budget {
+    pub bytes: u64,
+    pub unknown: usize,
+    pub room: Option<u64>,
+}
+
+impl Budget {
+    pub fn fits(&self) -> bool {
+        self.room.map(|r| self.bytes + SSD_RESERVE <= r).unwrap_or(true)
+    }
+}
+
+fn size_cache_path() -> PathBuf {
+    crate::config::dir().join("models_cache")
+}
+
+fn load_size_cache() -> HashMap<String, u64> {
+    std::fs::read_to_string(size_cache_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (k, n) = l.rsplit_once('\t')?;
+            Some((k.to_string(), n.parse().ok()?))
+        })
+        .collect()
 }
 
 fn now_secs() -> f64 {
@@ -225,7 +262,10 @@ impl Engine {
             want_log: Arc::new(AtomicBool::new(false)),
             seq: Arc::new(AtomicU64::new(1)),
             ssd_slots: Arc::new((Mutex::new(SSD_PARALLEL), Condvar::new())),
+            warmed: Arc::new(Mutex::new(HashSet::new())),
+            warm_busy: Arc::new(AtomicBool::new(false)),
         };
+        e.edit(|s| s.known_sizes = load_size_cache());
         e.load_local_outputs();
         e
     }
@@ -242,6 +282,16 @@ impl Engine {
         c.save();
         *self.cfg.lock().unwrap() = c;
         self.load_local_outputs();
+    }
+
+    /// 改设置并保存（不像 set_config 那样重新扫描出图目录，后台线程里用）
+    fn update_config(&self, f: impl FnOnce(&mut Config)) {
+        {
+            let mut c = self.cfg.lock().unwrap();
+            f(&mut c);
+            c.save();
+        }
+        self.edit(|_| {});
     }
 
     fn edit(&self, f: impl FnOnce(&mut State)) {
@@ -857,6 +907,27 @@ impl Engine {
                 s.comfy_log = p.log;
             }
         });
+        self.remember_room();
+        self.maybe_warm(p.queued);
+    }
+
+    /// 开着时量出这种 GPU 的 VM 上能放多少模型，记进设置（变化超过 1 GB 才写）
+    fn remember_room(&self) {
+        let Some(room) = self.ssd_room_now() else { return };
+        let cfg_gpu = self.config().gpu;
+        let gpu = {
+            let s = self.state();
+            if s.phase() != Phase::Running || !s.models.iter().any(|m| !m.name.is_empty()) {
+                return;
+            }
+            if s.hardware.is_empty() { cfg_gpu } else { s.hardware.clone() }
+        };
+        let old = self.config().ssd_room.get(&gpu).copied().unwrap_or(0);
+        if old.abs_diff(room) > 1 << 30 {
+            self.update_config(|c| {
+                c.ssd_room.insert(gpu, room);
+            });
+        }
     }
 
     /// 离闲置关机还剩多久
@@ -1001,6 +1072,11 @@ impl Engine {
                             }
                         }
                         list.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+                        for m in list.iter().filter(|m| !m.name.is_empty()) {
+                            s.known_sizes.insert(m.key(), m.size);
+                        }
+                        let cache: String = s.known_sizes.iter().map(|(k, n)| format!("{k}\t{n}\n")).collect();
+                        let _ = std::fs::write(size_cache_path(), cache);
                         s.models = list;
                     }
                     Err(err) => s.models_error = Some(err.to_string()),
@@ -1184,7 +1260,11 @@ impl Engine {
             self.copy_to_ssd(category.to_string(), name.to_string());
             return;
         }
-        // 取消：停掉排队 / 进行中的复制，删除副本
+        self.ssd_drop(category, name);
+    }
+
+    /// 停掉这个模型排队 / 进行中的复制，删掉 SSD 上的副本（不改设置里的选择）
+    fn ssd_drop(&self, category: &str, name: &str) {
         let active: Vec<u64> = self
             .state()
             .downloads
@@ -1233,6 +1313,176 @@ impl Engine {
                     e.copy_to_ssd(cat.to_string(), name.to_string());
                 }
             }
+        });
+    }
+
+    // ------------------------------------------------------------ SSD 空间和方案
+
+    /// 一个模型的大小：先看这次读到的模型列表，再看本机记住的
+    pub fn size_of(&self, key: &str) -> Option<u64> {
+        let s = self.state();
+        s.models.iter().find(|m| !m.name.is_empty() && m.key() == key).map(|m| m.size).or_else(|| s.known_sizes.get(key).copied())
+    }
+
+    /// 能拿来放模型的 SSD 空间：开着时 = 剩余 + 已复制的 + 正在复制已写下的；关着时用这种 GPU 上次量的
+    pub fn ssd_room_now(&self) -> Option<u64> {
+        let cfg = self.config();
+        let s = self.state();
+        if s.phase() == Phase::Running && s.disk.1 > 0 && s.models.iter().any(|m| !m.name.is_empty()) {
+            let on: u64 = s.models.iter().filter(|m| m.ssd).map(|m| m.size).sum();
+            let partial: u64 = s.downloads.iter().filter(|d| d.to_ssd && d.active()).map(|d| d.done).sum();
+            return Some(s.disk.1.saturating_sub(s.disk.0) + on + partial);
+        }
+        let gpu = if s.hardware.is_empty() { cfg.gpu.clone() } else { s.hardware.clone() };
+        cfg.ssd_room.get(&gpu).or_else(|| cfg.ssd_room.get(&cfg.gpu)).copied()
+    }
+
+    pub fn budget(&self, keys: &[String]) -> Budget {
+        let mut b = Budget { room: self.ssd_room_now(), ..Default::default() };
+        for k in keys {
+            match self.size_of(k) {
+                Some(n) => b.bytes += n,
+                None => b.unknown += 1,
+            }
+        }
+        b
+    }
+
+    /// 把一组模型存成方案（同名覆盖）
+    pub fn profile_save(&self, name: &str, keys: Vec<String>) -> anyhow::Result<()> {
+        if !crate::config::valid_profile_name(name) {
+            anyhow::bail!("方案名不能为空、不能超过 40 个字，也不能有 = | 换行");
+        }
+        if keys.is_empty() {
+            anyhow::bail!("方案里没有模型");
+        }
+        let n = name.trim().to_string();
+        self.update_config(|c| {
+            c.ssd_profiles.insert(n, keys);
+        });
+        Ok(())
+    }
+
+    pub fn profile_delete(&self, name: &str) -> bool {
+        let had = self.config().ssd_profiles.contains_key(name);
+        if had {
+            self.update_config(|c| {
+                c.ssd_profiles.remove(name);
+            });
+        }
+        had
+    }
+
+    /// 切换到一个方案：SSD 上只留方案里的模型（别的删掉腾地方），缺的开始复制。
+    /// 开着时空间不够直接报错；关着时只换选择，空间按上次量的估算，不够也照换但给提示。阻塞
+    pub fn profile_use(&self, name: &str) -> anyhow::Result<String> {
+        let cfg = self.config();
+        let keys = cfg.ssd_profiles.get(name).cloned().ok_or_else(|| anyhow::anyhow!("没有叫「{name}」的方案"))?;
+        let running = self.state().phase() == Phase::Running && self.ssh().is_some();
+        if running {
+            self.ensure_models()?;
+        }
+        let b = self.budget(&keys);
+        let mut warn = String::new();
+        if !b.fits() {
+            let m = format!(
+                "方案「{name}」要 {}，这台 VM 的 SSD 只能放约 {}",
+                fmt_bytes(b.bytes),
+                fmt_bytes(b.room.unwrap_or(0).saturating_sub(SSD_RESERVE))
+            );
+            if running {
+                anyhow::bail!(m);
+            }
+            warn = format!("；注意：{m}");
+        }
+        let want: HashSet<&String> = keys.iter().collect();
+        // 不在方案里的：选择里的、以及实际在 SSD 上的，都去掉
+        let mut drop: Vec<String> = cfg.ssd_models.iter().filter(|k| !want.contains(k)).cloned().collect();
+        let on_ssd: Vec<String> = self.state().models.iter().filter(|m| m.ssd).map(|m| m.key()).collect();
+        let mut removed = 0;
+        for k in on_ssd.iter().filter(|k| !want.contains(k)) {
+            removed += 1;
+            if !drop.contains(k) {
+                drop.push(k.clone());
+            }
+        }
+        self.update_config(|c| c.ssd_models = keys.clone());
+        let mut queued = 0;
+        let mut bytes = 0;
+        if running {
+            for k in &drop {
+                if let Some((c, n)) = k.split_once('/') {
+                    self.ssd_drop(c, n);
+                }
+            }
+            self.edit(|s| {
+                for m in s.models.iter_mut() {
+                    if m.ssd && !want.contains(&m.key()) {
+                        m.ssd = false;
+                    }
+                }
+            });
+            for k in &keys {
+                if on_ssd.contains(k) {
+                    continue;
+                }
+                if let Some((c, n)) = k.split_once('/') {
+                    self.copy_to_ssd(c.to_string(), n.to_string());
+                    queued += 1;
+                    bytes += self.size_of(k).unwrap_or(0);
+                }
+            }
+        }
+        Ok(if running {
+            format!("已切换到「{name}」：复制 {queued} 个（{}），从 SSD 删掉 {removed} 个", fmt_bytes(bytes))
+        } else {
+            let when = if cfg.ssd_auto { "开机后自动复制" } else { "开机后点「传输未完成的」复制（开机自动传输关着）" };
+            format!("已切换到「{name}」（{} 个模型，{}），{when}{warn}", keys.len(), fmt_bytes(b.bytes))
+        })
+    }
+
+    /// 界面用：后台切换方案，结果用通知显示
+    pub fn profile_use_bg(&self, name: String) {
+        let e = self.clone();
+        std::thread::spawn(move || match e.profile_use(&name) {
+            Ok(m) => e.notify(m, false),
+            Err(err) => e.notify(err.to_string(), true),
+        });
+    }
+
+    /// ComfyUI 开始跑的工作流里，有模型不在 SSD 上：自动复制过去（这次照旧从 Drive 读，下次就快了）
+    fn maybe_warm(&self, queued: Vec<(String, String)>) {
+        if queued.is_empty() || self.warm_busy.load(Ordering::SeqCst) {
+            return;
+        }
+        let cfg = self.config();
+        if !cfg.ssd_learn || !cfg.ssd_enabled() {
+            return;
+        }
+        let names: Vec<String> = {
+            let mut seen = self.warmed.lock().unwrap();
+            let fresh: HashSet<String> = queued.iter().map(|q| q.0.clone()).filter(|id| !seen.contains(id)).collect();
+            if fresh.is_empty() {
+                return;
+            }
+            seen.extend(fresh.iter().cloned());
+            queued.into_iter().filter(|q| fresh.contains(&q.0)).map(|q| q.1).collect()
+        };
+        self.warm_busy.store(true, Ordering::SeqCst);
+        let e = self.clone();
+        std::thread::spawn(move || {
+            let refs: Vec<workflow::ModelRef> = names.into_iter().map(|n| workflow::ModelRef { name: n, ..Default::default() }).collect();
+            if e.ensure_models().is_ok() {
+                let plan = workflow::plan(&refs, &e.state().models, &e.config().ssd_models);
+                let n = plan.to_copy().count();
+                if n > 0 {
+                    match e.apply_plan(&plan) {
+                        Ok(_) => e.notify(format!("这个工作流有 {n} 个模型不在 SSD 上，开始复制（{}），下次加载就快了", fmt_bytes(plan.copy_bytes())), false),
+                        Err(err) => e.notify(format!("这个工作流的 {n} 个模型没有自动复制到 SSD：{err}"), true),
+                    }
+                }
+            }
+            e.warm_busy.store(false, Ordering::SeqCst);
         });
     }
 
@@ -1504,6 +1754,8 @@ pub struct Poll {
     pub comfy_up: bool,
     pub queue: (u32, u32),
     pub log: Vec<String>,
+    /// 排队 / 运行中的任务用到的模型：(prompt_id, 文件名)
+    pub queued: Vec<(String, String)>,
 }
 
 pub fn parse_poll(out: &str) -> Poll {
@@ -1526,6 +1778,10 @@ pub fn parse_poll(out: &str) -> Poll {
         } else if let Some(q) = l.strip_prefix("queue ") {
             let (a, b) = two(q);
             p.queue = (a as u32, b as u32);
+        } else if let Some(x) = l.strip_prefix("qmodel ") {
+            if let Some((id, n)) = x.split_once('\t') {
+                p.queued.push((id.to_string(), n.to_string()));
+            }
         } else if let Some(x) = l.strip_prefix("log ") {
             p.log.push(x.to_string());
         } else if l == "log" {
@@ -1552,6 +1808,7 @@ mod tests {
         assert!(p.comfy_up);
         assert_eq!(p.queue, (1, 2));
         assert_eq!(p.log, vec!["hello"]);
+        assert_eq!(parse_poll("qmodel abc\tloras/x y.safetensors\n").queued, vec![("abc".to_string(), "loras/x y.safetensors".to_string())]);
         assert!(!parse_poll("comfy down\n").comfy_up);
     }
 

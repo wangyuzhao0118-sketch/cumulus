@@ -5,6 +5,7 @@
 #   disk <已用字节>\t<总字节>
 #   comfy up|down
 #   queue <运行中>\t<排队>
+#   qmodel <prompt_id>\t<模型文件名>   排队 / 运行中的工作流用到的模型（客户端据此自动复制到 SSD）
 #   out <相对路径>\t<大小>\t<修改时间>
 #   log <一行 ComfyUI 日志>
 import json, os, shutil, subprocess, sys, urllib.request
@@ -42,6 +43,26 @@ try:
     q = json.load(urllib.request.urlopen("http://127.0.0.1:8188/queue", timeout=2))
     print("comfy up")
     print(f"queue {len(q.get('queue_running', []))}\t{len(q.get('queue_pending', []))}")
+    EXTS = (".safetensors", ".sft", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx", ".pkl")
+
+    def names(v, out):
+        if isinstance(v, dict):
+            for x in v.values():
+                names(x, out)
+        elif isinstance(v, list):
+            for x in v:
+                names(x, out)
+        elif isinstance(v, str) and "://" not in v and "\n" not in v and v.lower().endswith(EXTS):
+            out.add(v.replace("\\", "/"))
+
+    for item in q.get("queue_running", []) + q.get("queue_pending", []):
+        try:
+            found = set()
+            names(item[2], found)
+            for n in sorted(found):
+                print(f"qmodel {item[1]}\t{n}")
+        except Exception:
+            pass
 except Exception:
     print("comfy down")
 

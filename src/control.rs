@@ -322,20 +322,7 @@ fn dispatch(e: &Engine, req: &Value) -> Result<Value> {
                 bail!("没有接 Google Drive，模型本来就在本地，不需要复制到 SSD");
             }
             need_running(e)?;
-            let text = match (req.get("text").and_then(Value::as_str), req.get("name").and_then(Value::as_str)) {
-                (Some(t), _) => t.to_string(),
-                (None, Some(n)) => {
-                    let names = e.workflows_now().unwrap_or_default();
-                    // 可以省略 .json，也可以只写文件名
-                    let pick = names
-                        .iter()
-                        .map(|x| x.0.clone())
-                        .find(|x| *x == n || *x == format!("{n}.json") || x.rsplit('/').next() == Some(n) || x.rsplit('/').next().map(|b| b == format!("{n}.json")).unwrap_or(false))
-                        .ok_or_else(|| anyhow!("ComfyUI 里没有叫 {n} 的工作流（cumulus workflows 查看）"))?;
-                    e.read_workflow(&pick)?
-                }
-                _ => bail!("缺少参数 text 或 name"),
-            };
+            let text = workflow_text(e, req)?.ok_or_else(|| anyhow!("缺少参数 text 或 name"))?;
             let plan = e.plan_workflow(&text)?;
             let mut v = plan.to_json();
             if req.get("apply").and_then(Value::as_bool).unwrap_or(false) {
@@ -343,6 +330,43 @@ fn dispatch(e: &Engine, req: &Value) -> Result<Value> {
                 v["tasks"] = json!(ids);
             }
             Ok(v)
+        }
+        "ssd_profiles" => Ok(profiles_json(e)),
+        // 存方案：keys 给定一组模型；或 text / name 给一个工作流（取它用到、Drive 上有的模型）；都没有就存当前选择
+        "ssd_profile_save" => {
+            let pname = str_arg(req, "profile")?;
+            let keys: Vec<String> = if let Some(k) = req.get("keys").and_then(Value::as_array) {
+                k.iter().filter_map(Value::as_str).map(String::from).collect()
+            } else if req.get("text").is_some() || req.get("name").is_some() {
+                need_running(e)?;
+                let text = workflow_text(e, req)?.unwrap_or_default();
+                e.plan_workflow(&text)?.found.into_iter().map(|f| f.0).collect()
+            } else {
+                e.config().ssd_models
+            };
+            for k in &keys {
+                split_key(k)?;
+            }
+            e.profile_save(pname, keys)?;
+            Ok(profiles_json(e))
+        }
+        "ssd_profile_use" => {
+            if !e.config().ssd_enabled() {
+                bail!("没有接 Google Drive，模型本来就在本地，不需要复制到 SSD");
+            }
+            let pname = str_arg(req, "profile")?;
+            wait_checked(e);
+            let msg = e.profile_use(pname)?;
+            let keys = e.config().ssd_models;
+            let ids: Vec<u64> = e.state().downloads.iter().filter(|d| d.to_ssd && d.active() && keys.contains(&format!("{}/{}", d.category, d.name))).map(|d| d.id).collect();
+            Ok(json!({"message": msg, "tasks": ids}))
+        }
+        "ssd_profile_rm" => {
+            let pname = str_arg(req, "profile")?;
+            if !e.profile_delete(pname) {
+                bail!("没有叫「{pname}」的方案");
+            }
+            Ok(profiles_json(e))
         }
         "ssd_sync" => {
             need_running(e)?;
@@ -386,6 +410,47 @@ fn dispatch(e: &Engine, req: &Value) -> Result<Value> {
         "" => bail!("缺少 cmd"),
         other => bail!("不认识的命令：{other}"),
     }
+}
+
+/// 请求里的工作流：text = 原文；name = ComfyUI 里保存的工作流（可以省略 .json，也可以只写文件名）
+fn workflow_text(e: &Engine, req: &Value) -> Result<Option<String>> {
+    if let Some(t) = req.get("text").and_then(Value::as_str) {
+        return Ok(Some(t.to_string()));
+    }
+    let Some(n) = req.get("name").and_then(Value::as_str) else { return Ok(None) };
+    let names = e.workflows_now().unwrap_or_default();
+    let base = |x: &str| x.rsplit('/').next().unwrap_or(x).to_string();
+    let pick = names
+        .iter()
+        .map(|x| x.0.clone())
+        .find(|x| *x == n || *x == format!("{n}.json") || base(x) == n || base(x) == format!("{n}.json"))
+        .ok_or_else(|| anyhow!("ComfyUI 里没有叫 {n} 的工作流（cumulus workflows 查看）"))?;
+    Ok(Some(e.read_workflow(&pick)?))
+}
+
+fn budget_json(b: &crate::engine::Budget) -> Value {
+    json!({"bytes": b.bytes, "unknown_sizes": b.unknown, "room": b.room, "fits": b.fits()})
+}
+
+fn profiles_json(e: &Engine) -> Value {
+    let cfg = e.config();
+    let cur: std::collections::BTreeSet<&String> = cfg.ssd_models.iter().collect();
+    let list: Vec<Value> = cfg
+        .ssd_profiles
+        .iter()
+        .map(|(n, keys)| {
+            let active = keys.iter().collect::<std::collections::BTreeSet<_>>() == cur;
+            json!({"name": n, "models": keys, "active": active, "budget": budget_json(&e.budget(keys))})
+        })
+        .collect();
+    json!({
+        "profiles": list,
+        "selected": cfg.ssd_models,
+        "selected_budget": budget_json(&e.budget(&cfg.ssd_models)),
+        "auto_on_boot": cfg.ssd_auto,
+        "auto_on_run": cfg.ssd_learn,
+        "reserve": crate::engine::SSD_RESERVE,
+    })
 }
 
 fn opt_secs(d: Option<Duration>) -> Value {
@@ -455,13 +520,18 @@ fn tasks(e: &Engine) -> Vec<Value> {
         .collect()
 }
 
+/// 方案和测出来的空间由专门的命令管，不走 config get/set
+fn internal_key(k: &str) -> bool {
+    k.starts_with("ssd_profile.") || k == "ssd_room"
+}
+
 /// 设置项：令牌不回传，只说有没有设
 const SECRET: &[&str] = &["hf_token", "civitai_token"];
 
 fn config_json(c: &Config) -> Value {
     let mut m = Map::new();
     for l in c.serialize().lines() {
-        if let Some((k, v)) = l.split_once('=') {
+        if let Some((k, v)) = l.split_once('=').filter(|(k, _)| !internal_key(k)) {
             let v = if SECRET.contains(&k) { json!(if v.is_empty() { "" } else { "（已设置）" }) } else { json!(v) };
             m.insert(k.into(), v);
         }
@@ -470,7 +540,7 @@ fn config_json(c: &Config) -> Value {
 }
 
 fn config_set(old: &Config, key: &str, value: &str, busy: bool) -> Result<Config> {
-    let keys: Vec<String> = old.serialize().lines().filter_map(|l| l.split_once('=').map(|x| x.0.to_string())).collect();
+    let keys: Vec<String> = old.serialize().lines().filter_map(|l| l.split_once('=').map(|x| x.0.to_string())).filter(|k| !internal_key(k)).collect();
     if !keys.iter().any(|k| k == key) {
         bail!("没有这个设置项：{key}（可选：{}）", keys.join(", "));
     }
@@ -481,8 +551,8 @@ fn config_set(old: &Config, key: &str, value: &str, busy: bool) -> Result<Config
         bail!("VM 开着的时候不能改 {key}，先 cumulus down");
     }
     let v = match value.to_ascii_lowercase().as_str() {
-        "true" | "on" | "yes" if matches!(key, "mount_drive" | "output_to_drive" | "ssd_auto") => "1".to_string(),
-        "false" | "off" | "no" if matches!(key, "mount_drive" | "output_to_drive" | "ssd_auto") => "0".to_string(),
+        "true" | "on" | "yes" if matches!(key, "mount_drive" | "output_to_drive" | "ssd_auto" | "ssd_learn") => "1".to_string(),
+        "false" | "off" | "no" if matches!(key, "mount_drive" | "output_to_drive" | "ssd_auto" | "ssd_learn") => "0".to_string(),
         _ if key == "gpu" => value.to_ascii_uppercase(),
         _ => value.to_string(),
     };
@@ -589,6 +659,8 @@ mod tests {
         assert_eq!(config_set(&c, "max_hours", "6.0", false).unwrap().max_hours, 6.0);
         assert!(!config_set(&c, "ssd_auto", "off", false).unwrap().ssd_auto);
         assert!(config_set(&c, "nope", "1", false).is_err());
+        assert!(config_set(&c, "ssd_room", "A100:1", false).is_err());
+        assert!(!config_set(&c, "ssd_learn", "off", false).unwrap().ssd_learn);
         assert!(config_set(&c, "session", "x", true).is_err());
         let j = config_json(&Config { hf_token: "hf_secret".into(), ..c });
         assert_eq!(j["config"]["hf_token"], "（已设置）");

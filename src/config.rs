@@ -1,4 +1,5 @@
 //! 设置：存在 ~/Library/Application Support/cumulus/config，每行一个 key=value。
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -30,6 +31,22 @@ pub struct Config {
     pub ssd_models: Vec<String>,
     /// 开机后自动把 ssd_models 复制到 SSD
     pub ssd_auto: bool,
+    /// ComfyUI 开始跑一个工作流时，把它用到、还不在 SSD 上的模型自动复制过去（下次加载就快了）
+    pub ssd_learn: bool,
+    /// SSD 方案：名字 → 一组模型（按工作流分，比如「Qwen 出图」「视频」），切换时整组换上
+    pub ssd_profiles: BTreeMap<String, Vec<String>>,
+    /// 每种 GPU 的 VM 上能拿来放模型的 SSD 空间（字节，开机时量出来记住，关机时用来估算）
+    pub ssd_room: BTreeMap<String, u64>,
+}
+
+/// 方案名：不能有 = | 换行，不能太长
+pub fn valid_profile_name(n: &str) -> bool {
+    let n = n.trim();
+    !n.is_empty() && n.chars().count() <= 40 && !n.contains(['=', '|', '\n', '\r'])
+}
+
+fn split_keys(v: &str) -> Vec<String> {
+    v.split('|').map(str::trim).filter(|x| x.contains('/')).map(String::from).collect()
 }
 
 pub const GPUS: &[&str] = &["T4", "L4", "A100", "H100", "G4", "CPU"];
@@ -55,6 +72,9 @@ impl Default for Config {
             theme: "dark".into(),
             ssd_models: Vec::new(),
             ssd_auto: true,
+            ssd_learn: true,
+            ssd_profiles: BTreeMap::new(),
+            ssd_room: BTreeMap::new(),
         }
     }
 }
@@ -129,8 +149,24 @@ impl Config {
                 "hf_token" => c.hf_token = v,
                 "civitai_token" => c.civitai_token = v,
                 "theme" => c.theme = v,
-                "ssd_models" => c.ssd_models = v.split('|').map(str::trim).filter(|x| x.contains('/')).map(String::from).collect(),
+                "ssd_models" => c.ssd_models = split_keys(&v),
                 "ssd_auto" => c.ssd_auto = b,
+                "ssd_learn" => c.ssd_learn = b,
+                "ssd_room" => {
+                    c.ssd_room = v
+                        .split('|')
+                        .filter_map(|p| {
+                            let (g, n) = p.split_once(':')?;
+                            Some((g.trim().to_string(), n.trim().parse().ok()?))
+                        })
+                        .collect()
+                }
+                k if k.starts_with("ssd_profile.") => {
+                    let name = &k["ssd_profile.".len()..];
+                    if valid_profile_name(name) {
+                        c.ssd_profiles.insert(name.trim().to_string(), split_keys(&v));
+                    }
+                }
                 _ => {}
             }
         }
@@ -158,6 +194,11 @@ impl Config {
             self.theme,
             self.ssd_models.join("|"),
             b(self.ssd_auto),
+        ) + &format!(
+            "ssd_learn={}\nssd_room={}\n{}",
+            b(self.ssd_learn),
+            self.ssd_room.iter().map(|(g, n)| format!("{g}:{n}")).collect::<Vec<_>>().join("|"),
+            self.ssd_profiles.iter().map(|(n, k)| format!("ssd_profile.{n}={}\n", k.join("|"))).collect::<String>()
         )
     }
 
@@ -227,8 +268,14 @@ mod tests {
         c.hf_token = "hf_x".into();
         c.ssd_models = vec!["checkpoints/a b.safetensors".into(), "loras/sub/x.safetensors".into()];
         c.ssd_auto = false;
+        c.ssd_learn = false;
+        c.ssd_profiles.insert("视频 Wan".into(), vec!["diffusion_models/wan.safetensors".into(), "vae/w.safetensors".into()]);
+        c.ssd_profiles.insert("empty".into(), vec![]);
+        c.ssd_room.insert("A100".into(), 180 << 30);
+        c.ssd_room.insert("L4".into(), 200 << 30);
         assert_eq!(Config::parse(&c.serialize()), c);
-        assert_eq!(Config::parse("gpu=XX\nidle_min=abc\n"), Config::default());
+        assert_eq!(Config::parse("gpu=XX\nidle_min=abc\nssd_profile.a|b=x/y\n"), Config::default());
+        assert!(valid_profile_name(" Qwen 出图 ") && !valid_profile_name("a=b") && !valid_profile_name(""));
         assert_eq!(c.remote_output(), "/content/drive/MyDrive/AI_Models/ComfyUI_L4/output");
     }
 }

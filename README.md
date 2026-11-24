@@ -31,12 +31,14 @@ cumulus help
 ```bash
 cumulus up --gpu L4                 # 开机并启动 ComfyUI，等到就绪（打印 ComfyUI 地址）
 cumulus status                      # 阶段、GPU、CU 余额、自动关机倒计时
-cumulus run flux_api.json           # 提交 API 格式工作流，等跑完并同步回本机，打印本机文件路径
+cumulus run flux_api.json           # 提交 API 格式工作流（先把用到的模型复制到 SSD），等跑完并同步回本机，打印本机文件路径
 cumulus models                      # Drive 上的模型（标出哪些在本地 SSD）
 cumulus download loras <地址>        # 在 VM 上下载模型到 Drive
 cumulus ssd add checkpoints/x.safetensors   # 复制到 VM 本地 SSD
 cumulus ssd from flux_api.json      # 工作流用到的模型全部复制到 SSD（--dry-run 只看）
 cumulus workflows                   # ComfyUI 里保存的工作流（ssd from 也可以直接写它们的名字）
+cumulus ssd profile save 视频 --from wan_t2v   # 把一个工作流用到的模型存成 SSD 方案
+cumulus ssd profile use 视频         # 整组换上：SSD 上只留方案里的模型
 cumulus exec nvidia-smi             # 在 VM 上执行命令（复用已有连接）
 cumulus config set idle_min 20      # 修改设置
 cumulus down                        # 同步出图后关机
@@ -46,6 +48,11 @@ cumulus down                        # 同步出图后关机
 - **给 AI 用**：每个命令都可以加 `--json`，stdout 只输出一个 JSON 对象（出错时 `{"ok": false, "error": "…"}`）；等待过程中的日志和进度写到 stderr（不是终端时每 15 秒一行，免得刷屏）。退出码 0 成功、1 失败（`exec` 原样返回 VM 上命令的退出码）。`up` / `down` / `run` / `download` / `ssd add` 默认等到完成，`--no-wait` 立即返回。
 - **需要人做的一步**：新 VM 挂 Drive 要在浏览器里点「允许」。`up` 会打印授权地址并等待；授权后在终端按回车，或运行 `cumulus drive-continue`。
 - **危险操作**要显式确认：`rm-model` 必须加 `--yes`。令牌（`hf_token` 等）可以用 `config set` 设置，但 `config` 不会把它们显示出来。
+- **给 AI 的使用说明**：`skills/cumulus/SKILL.md` 是一个 Claude Code Skill，写了什么时候用哪个命令、开机花钱要记得关、Drive 授权要用户自己点、删除前要问。装上后 AI 助手会自动按它操作：
+
+  ```bash
+  mkdir -p ~/.claude/skills && ln -sf "$PWD/skills/cumulus" ~/.claude/skills/cumulus
+  ```
 - `CUMULUS_CONFIG_DIR=<目录>` 可以用另一套设置（会话名不同就是另一台 VM），测试时不会碰到正在用的 VM。
 
 ## 工作方式
@@ -64,6 +71,8 @@ cumulus down                        # 同步出图后关机
 - **模型下载**：粘贴 Hugging Face / Civitai / 任意直链，选类别，在 VM 上直接下载到 Drive 的 `models/<类别>/`（Colab 机房带宽），显示进度和速度，可以取消，再次下载同一地址会断点续传。需要授权的模型在设置里填 HF / Civitai 令牌。「已有模型」按类别列出 Drive 里的模型和大小，可以删除（进 Drive 回收站）。
 - **本地 SSD 加速**：Colab 的 Drive 挂载（DriveFS）每个文件只走一条连接，没缓存过的文件只有约 35–50 MB/s；它自带的本地缓存约 64 GB，满了会淘汰旧文件。「模型」页每个模型后面有「SSD」开关，打开后在 VM 上把它复制到本地 SSD `/content/cumulus_ssd/models/<类别>/`：直接调 Drive API，对一个文件开 16 条连接、按 128 MB 分块下载（L4 实测约 300 MB/s，是挂载目录的 6–8 倍），访问令牌用 DriveFS 自己用的那个（Colab VM 元数据服务提供，只在 VM 上用）；拿不到令牌或找不到文件时自动退回从挂载目录顺序复制。同时复制 2 个文件，可以取消，中断后按块接着下载。`extra_model_paths.yaml` 里本地 SSD 排在 Drive 前面，同名模型 ComfyUI 优先从 SSD 读，没复制的照旧从 Drive 读，工作流不用改。选择会保存在设置里，开机后自动重新复制（可关）；关机后 SSD 上的副本随 VM 消失，Drive 原文件不受影响。重新接上旧版本启动的 VM 时，如果配置里还没有 SSD 目录且没有任务在跑，会自动重启 ComfyUI 换上新配置。
 - **按工作流导入 SSD**：「本地 SSD 加速」卡片上点「从工作流导入…」，选 ComfyUI 里保存的工作流（接了 Drive 就在 Drive 的 `workflows/` 下）或本机的 .json 文件，列出它用到的模型：哪些已在 SSD、哪些要复制、Drive 上缺哪些，点一下全部复制（先检查 SSD 空间）。界面格式（包括子图）和 API 格式都支持：整个工作流里找模型文件名（.safetensors / .gguf / .ckpt / .pt / .pth 等），先按完整名字、再按文件名和 Drive 上的模型对上；同名文件在几个类别里都有时，按官方模板里标注的类别选。模板里带下载地址的缺失模型可以直接点「下载」到对应类别。命令行是 `cumulus ssd from <工作流>`。
+- **SSD 方案和容量**：把一组模型存成方案（按工作流分，比如「Qwen 出图」「视频」），点一下整组换上：SSD 上只留方案里的模型，别的删掉腾地方（开着时会先确认），缺的开始复制。可以把当前选择存成方案，也可以在「从工作流导入」里把工作流用到的模型存成方案。每种 GPU 的 VM 上能放多少模型，开机时量出来记在设置里（`ssd_room`），模型大小也记在本机（`models_cache`），所以关机时也能看到「已选 28.5 GB / SSD 可放约 37 GB」、方案放不放得下；放不下会标黄，开着时切换会直接拒绝。
+- **运行时自动复制**（默认开）：ComfyUI 开始跑一个工作流时（不管是在浏览器里点的还是命令行提交的），把它用到、还不在 SSD 上的模型复制过去，这次照旧从 Drive 读，下次加载就快了；SSD 放不下就提示，不复制。`cumulus run` 更进一步：提交前先复制完再跑（`--no-ssd` 跳过）。
 - **从旧名字 Nimbus 升级**：第一次打开时把 `~/Library/Application Support/nimbus/` 整个搬到 `cumulus/`（设置、ssh 密钥都保留）；旧设置没写会话名的沿用旧的 `nimbus`，所以能直接接上正在跑的 VM；旧程序留下的 ssh 连接会被清掉。
 - **设置**保存在 `~/Library/Application Support/cumulus/config`（权限 600，里面有令牌）。
 
@@ -75,6 +84,7 @@ cumulus down                        # 同步出图后关机
 - `src/main.rs`：界面（控制台、模型、出图、日志、设置）、守护模式、自测
 - `src/cli.rs`、`src/control.rs`：命令行，以及掌管进程上的本机控制接口
 - `src/workflow.rs`：从工作流里找出用到的模型，和 Drive 上的模型对上
+- `skills/cumulus/SKILL.md`：给 AI 助手（Claude Code）的使用说明
 - `kit/boot.sh`、`kit/poll.py`、`kit/dl.py`、`kit/cp.py`：在 VM 上执行的脚本（编译时打进程序，每次通过 ssh 送过去）
 - `src/theme.rs`、`src/anim.rs`、`src/input.rs`：沿用 prj22（Lithium）的主题、动画和输入框
 - `assets/cu.svg` → `tools/make-icon.sh assets/cu.svg` 生成 `assets/AppIcon.icns`（和 Lithium 同一套黑底粗体图标，缩写 Cu = 铜）
