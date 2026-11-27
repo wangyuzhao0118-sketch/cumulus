@@ -37,6 +37,8 @@ pub struct Config {
     pub ssd_profiles: BTreeMap<String, Vec<String>>,
     /// 每种 GPU 的 VM 上能拿来放模型的 SSD 空间（字节，开机时量出来记住，关机时用来估算）
     pub ssd_room: BTreeMap<String, u64>,
+    /// 开机用的 Colab 账号（accounts.json 里的 id，default = colab CLI 原来登录的那个）
+    pub account: String,
 }
 
 /// 方案名：不能有 = | 换行，不能太长
@@ -75,6 +77,7 @@ impl Default for Config {
             ssd_learn: true,
             ssd_profiles: BTreeMap::new(),
             ssd_room: BTreeMap::new(),
+            account: "default".into(),
         }
     }
 }
@@ -152,6 +155,7 @@ impl Config {
                 "ssd_models" => c.ssd_models = split_keys(&v),
                 "ssd_auto" => c.ssd_auto = b,
                 "ssd_learn" => c.ssd_learn = b,
+                "account" if !v.is_empty() => c.account = v,
                 "ssd_room" => {
                     c.ssd_room = v
                         .split('|')
@@ -195,8 +199,9 @@ impl Config {
             self.ssd_models.join("|"),
             b(self.ssd_auto),
         ) + &format!(
-            "ssd_learn={}\nssd_room={}\n{}",
+            "ssd_learn={}\naccount={}\nssd_room={}\n{}",
             b(self.ssd_learn),
+            self.account,
             self.ssd_room.iter().map(|(g, n)| format!("{g}:{n}")).collect::<Vec<_>>().join("|"),
             self.ssd_profiles.iter().map(|(n, k)| format!("ssd_profile.{n}={}\n", k.join("|"))).collect::<String>()
         )
@@ -273,6 +278,7 @@ mod tests {
         c.ssd_profiles.insert("empty".into(), vec![]);
         c.ssd_room.insert("A100".into(), 180 << 30);
         c.ssd_room.insert("L4".into(), 200 << 30);
+        c.account = "a1b2".into();
         assert_eq!(Config::parse(&c.serialize()), c);
         assert_eq!(Config::parse("gpu=XX\nidle_min=abc\nssd_profile.a|b=x/y\n"), Config::default());
         assert!(valid_profile_name(" Qwen 出图 ") && !valid_profile_name("a=b") && !valid_profile_name(""));

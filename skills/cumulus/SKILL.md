@@ -28,7 +28,8 @@ cumulus status --json
 3. **Google Drive 授权只能用户自己点。** 新 VM 挂 Drive 时，`up` 会在 stderr 打印授权地址，`status --json` 的 `drive.auth_url` 也有。把地址告诉用户，请用户在浏览器里点「允许」，等用户说好了再运行 `cumulus drive-continue`。不要自己去点授权页。
 4. **删除要先问。** `rm-model` 会把模型从 Drive 删掉（进回收站），必须加 `--yes`；先征得用户同意再执行。`ssd profile use` 会删掉 SSD 上不在方案里的副本（Drive 上的不动），切换前告诉用户。
 5. **不要回显令牌。** `config set hf_token …` 可以设置令牌，但不要把值写进回复里；`config` 也不会显示它们。
-6. **`exec` 以 root 在 VM 上执行。** 可以用来查看（`nvidia-smi`、`ls`、`df -h`、`tail`），会改东西或删东西的命令先问用户。
+6. **账号登录也只能用户自己来。** `account add` / `account login` 打印 Google 登录地址；把地址交给用户，用户登录后会拿到一串授权码，由用户提供后再 `cumulus account code <授权码>`。不要自己去打开或操作登录页。换账号（`account use`）要先关机，而且会改变扣哪个账号的 CU，用户没说就别换。
+7. **`exec` 以 root 在 VM 上执行。** 可以用来查看（`nvidia-smi`、`ls`、`df -h`、`tail`），会改东西或删东西的命令先问用户。
 
 ## 出图 / 出视频
 
@@ -44,6 +45,15 @@ cumulus run workflow_api.json      # 提交，等跑完，打印同步回本机�
 - **出错时**：提交被拒，错误里有节点错误（缺节点、参数不对）；跑的时候出错，会给出异常和节点。`cumulus logs --comfy -n 80` 看 ComfyUI 自己的日志。缺模型时看下一节。
 - **中断**：`cumulus interrupt` 中断正在跑的任务。
 - **SSD 预热**：`run` 提交前会先把工作流用到、还不在 SSD 上的模型复制到 SSD（第一次要等复制，之后加载快很多），`--no-ssd` 跳过。
+
+## 账号和余额
+
+```bash
+cumulus account --refresh --json   # 每个账号的 balance、email，active=true 的是开机用的；total_balance 是合计
+cumulus account use <名字>          # 换开机用的账号（先 down）
+```
+
+`status --json` 的 `account` 是当前开机用的账号，`cu.balance` 是它的余额。某个账号余额不够时，可以告诉用户其他账号还有多少，由用户决定换不换。
 
 ## 模型
 

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::accounts::{self, Account};
 use crate::config::Config;
 use crate::workflow::{self, Plan};
 use crate::remote::{self, Ssh, Usage, fmt_bytes, sh_quote};
@@ -190,6 +191,26 @@ pub struct State {
     /// 自动关机的原因（关机后在界面上显示）
     pub auto_stopped: Option<String>,
     pub local_port: u16,
+    /// Colab 账号和各自的 CU 余额
+    pub accounts: Vec<Account>,
+    /// 正在查所有账号的余额
+    pub accounts_busy: bool,
+    /// 正在登录的账号
+    pub login: Option<Login>,
+}
+
+/// 登录一个 Colab 账号：拿到授权地址 → 用户在浏览器里登录、复制授权码 → 贴回来
+#[derive(Clone, Debug, Default)]
+pub struct Login {
+    pub id: String,
+    pub name: String,
+    /// 重新登录已有的账号（令牌过期了）
+    pub existing: bool,
+    pub url: Option<String>,
+    /// 授权码已提交，正在换令牌
+    pub busy: bool,
+    pub error: Option<String>,
+    pub started: Option<Instant>,
 }
 
 impl State {
@@ -214,6 +235,9 @@ pub struct Engine {
     /// 已经检查过（自动预热过）的 ComfyUI 任务
     warmed: Arc<Mutex<HashSet<String>>>,
     warm_busy: Arc<AtomicBool>,
+    /// 登录进程（等着输入授权码）
+    login_child: Arc<Mutex<Option<Child>>>,
+    login_stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
 
 /// 一组模型放 SSD 要多大：bytes 是已知大小的合计，unknown 是不知道大小的个数，
@@ -264,8 +288,21 @@ impl Engine {
             ssd_slots: Arc::new((Mutex::new(SSD_PARALLEL), Condvar::new())),
             warmed: Arc::new(Mutex::new(HashSet::new())),
             warm_busy: Arc::new(AtomicBool::new(false)),
+            login_child: Arc::new(Mutex::new(None)),
+            login_stdin: Arc::new(Mutex::new(None)),
         };
-        e.edit(|s| s.known_sizes = load_size_cache());
+        let list = accounts::load();
+        let acct = e.config().account;
+        if list.iter().any(|a| a.id == acct) {
+            remote::set_account(&acct);
+        } else {
+            e.update_config(|c| c.account = remote::DEFAULT_ACCOUNT.into());
+            remote::set_account(remote::DEFAULT_ACCOUNT);
+        }
+        e.edit(|s| {
+            s.known_sizes = load_size_cache();
+            s.accounts = list;
+        });
         e.load_local_outputs();
         e
     }
@@ -390,8 +427,14 @@ impl Engine {
                 },
                 Err(err) => {
                     let m = err.to_string();
-                    if m.contains("auth") || m.contains("credential") || m.contains("token") {
-                        e.set_phase(Phase::Failed(format!("colab 未登录：在终端运行一次 colab sessions 完成登录（{m}）")));
+                    if m.contains("auth") || m.contains("credential") || m.contains("token") || m.contains("EOF when reading") {
+                        let id = remote::account();
+                        e.set_phase(Phase::Failed(if id == remote::DEFAULT_ACCOUNT {
+                            "colab 未登录：在终端运行一次 colab sessions 完成登录".to_string()
+                        } else {
+                            "这个账号需要重新登录：到「设置 → Colab 账号」点「重新登录」".to_string()
+                        }));
+                        e.log(m);
                     } else {
                         e.log(format!("查询会话失败：{m}"));
                         e.set_phase(Phase::Off);
@@ -780,11 +823,343 @@ impl Engine {
     }
 
     pub fn refresh_usage(&self) {
+        let acct = remote::account();
         if let Ok(u) = remote::usage() {
             self.edit(|s| {
                 s.usage = u;
                 s.usage_at = Some(Instant::now());
             });
+            self.edit_account(&acct, |a| {
+                a.balance = u.balance;
+                a.rate = u.rate;
+                a.checked = now_secs() as u64;
+                a.error = None;
+            });
+        }
+    }
+
+    // ------------------------------------------------------------ 账号
+
+    /// 改一个账号的记录并存盘
+    fn edit_account(&self, id: &str, f: impl FnOnce(&mut Account)) {
+        let list = {
+            let mut s = self.st.lock().unwrap();
+            let Some(a) = s.accounts.iter_mut().find(|a| a.id == id) else { return };
+            f(a);
+            s.version += 1;
+            s.accounts.clone()
+        };
+        accounts::save(&list);
+    }
+
+    pub fn accounts(&self) -> Vec<Account> {
+        self.state().accounts.clone()
+    }
+
+    /// 查所有账号的余额（各自一个 colab usage，并行），顺便补上不知道的邮箱
+    pub fn refresh_accounts(&self) {
+        {
+            let mut s = self.state();
+            if s.accounts_busy {
+                return;
+            }
+            s.accounts_busy = true;
+            s.version += 1;
+        }
+        let e = self.clone();
+        std::thread::spawn(move || {
+            let active = remote::account();
+            let list = e.accounts();
+            let handles: Vec<_> = list
+                .into_iter()
+                .map(|a| {
+                    std::thread::spawn(move || {
+                        let u = remote::usage_of(&a.id);
+                        let email = if a.email.is_empty() && u.is_ok() { remote::whoami(&a.id).ok() } else { None };
+                        (a.id, u, email)
+                    })
+                })
+                .collect();
+            for h in handles {
+                let Ok((id, u, email)) = h.join() else { continue };
+                if id == active {
+                    if let Ok(u) = &u {
+                        let u = *u;
+                        e.edit(|s| {
+                            s.usage = u;
+                            s.usage_at = Some(Instant::now());
+                        });
+                    }
+                }
+                e.edit_account(&id, |a| {
+                    match &u {
+                        Ok(u) => {
+                            a.balance = u.balance;
+                            a.rate = u.rate;
+                            a.checked = now_secs() as u64;
+                            a.error = None;
+                        }
+                        Err(err) => a.error = Some(err.to_string()),
+                    }
+                    if let Some(m) = email {
+                        a.email = m;
+                    }
+                });
+            }
+            e.edit(|s| s.accounts_busy = false);
+        });
+    }
+
+    /// 后台每 15 分钟查一次所有账号的余额（开着的账号另外每分钟查）
+    pub fn start_account_poller(&self) {
+        let e = self.clone();
+        std::thread::spawn(move || loop {
+            e.refresh_accounts();
+            std::thread::sleep(Duration::from_secs(15 * 60));
+        });
+    }
+
+    /// 换开机用的账号（关机状态才能换），换完查一下新账号有没有在跑的 VM
+    pub fn account_use(&self, id: &str) -> anyhow::Result<()> {
+        if self.state().phase().busy() {
+            anyhow::bail!("VM 正在运行，先关机再换账号");
+        }
+        let a = self.accounts().into_iter().find(|a| a.id == id).ok_or_else(|| anyhow::anyhow!("没有这个账号"))?;
+        if remote::account() == a.id {
+            return Ok(());
+        }
+        self.update_config(|c| c.account = a.id.clone());
+        remote::set_account(&a.id);
+        self.edit(|s| {
+            s.usage = Usage { balance: a.balance, rate: None };
+            s.usage_at = None;
+            s.auto_stopped = None;
+            s.models.clear();
+            s.models_error = None;
+            s.workflows = None;
+            s.wf_plan = None;
+        });
+        self.log(format!("换成账号 {}", a.label()));
+        self.check_existing();
+        Ok(())
+    }
+
+    pub fn account_rename(&self, id: &str, name: &str) -> anyhow::Result<()> {
+        if !accounts::valid_name(name) {
+            anyhow::bail!("名字不能为空，最多 30 个字");
+        }
+        if self.accounts().iter().any(|a| a.id != id && a.name == name.trim()) {
+            anyhow::bail!("已经有叫「{}」的账号了", name.trim());
+        }
+        if !self.accounts().iter().any(|a| a.id == id) {
+            anyhow::bail!("没有这个账号");
+        }
+        self.edit_account(id, |a| a.name = name.trim().to_string());
+        Ok(())
+    }
+
+    /// 删掉一个账号（钥匙串里的令牌一起删；主账号不能删，正在用的要先换走）
+    pub fn account_remove(&self, id: &str) -> anyhow::Result<()> {
+        if id == remote::DEFAULT_ACCOUNT {
+            anyhow::bail!("主账号（colab 命令行自己登录的那个）不能删");
+        }
+        if remote::account() == id {
+            anyhow::bail!("这个账号正在用，先换成别的账号");
+        }
+        let list = {
+            let mut s = self.state();
+            let n = s.accounts.len();
+            s.accounts.retain(|a| a.id != id);
+            if s.accounts.len() == n {
+                anyhow::bail!("没有这个账号");
+            }
+            s.version += 1;
+            s.accounts.clone()
+        };
+        accounts::save(&list);
+        remote::forget(id);
+        Ok(())
+    }
+
+    /// 开始登录：新加账号（id = None）或重新登录已有账号。授权地址出来后在 state.login.url 里
+    pub fn login_start(&self, id: Option<&str>, name: &str) -> anyhow::Result<String> {
+        if self.state().login.as_ref().is_some_and(|l| l.error.is_none()) {
+            anyhow::bail!("已经有一个账号在登录，先完成或取消");
+        }
+        self.login_cancel();
+        let list = self.accounts();
+        let (id, name, existing) = match id {
+            Some(id) => {
+                let a = list.iter().find(|a| a.id == id).ok_or_else(|| anyhow::anyhow!("没有这个账号"))?;
+                (a.id.clone(), a.name.clone(), true)
+            }
+            None => {
+                let name = name.trim();
+                if !accounts::valid_name(name) {
+                    anyhow::bail!("给账号起个名字（最多 30 个字）");
+                }
+                if list.iter().any(|a| a.name == name) {
+                    anyhow::bail!("已经有叫「{name}」的账号了");
+                }
+                (accounts::new_id(&list), name.to_string(), false)
+            }
+        };
+        let mut child = remote::login(&id)?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        *self.login_stdin.lock().unwrap() = stdin;
+        *self.login_child.lock().unwrap() = Some(child);
+        self.edit(|s| s.login = Some(Login { id: id.clone(), name: name.clone(), existing, started: Some(Instant::now()), ..Default::default() }));
+
+        let out = Arc::new(Mutex::new(String::new()));
+        let readers: Vec<_> = [stdout.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), stderr.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>)]
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                let (e, out, id) = (self.clone(), out.clone(), id.clone());
+                std::thread::spawn(move || {
+                    for line in BufReader::new(r).lines().map_while(Result::ok) {
+                        let l = remote::strip_ansi(&line);
+                        if let Some(u) = l.split_whitespace().find(|w| w.starts_with("https://accounts.google.com/")) {
+                            let u = u.to_string();
+                            e.edit(|s| {
+                                if let Some(lg) = s.login.as_mut().filter(|lg| lg.id == id) {
+                                    lg.url = Some(u);
+                                }
+                            });
+                        } else {
+                            out.lock().unwrap().push_str(&l);
+                            out.lock().unwrap().push('\n');
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let e = self.clone();
+        let id2 = id.clone();
+        std::thread::spawn(move || {
+            for r in readers {
+                let _ = r.join();
+            }
+            let ok = loop {
+                let mut g = e.login_child.lock().unwrap();
+                let Some(c) = g.as_mut() else { return }; // 取消了
+                match c.try_wait() {
+                    Ok(Some(st)) => {
+                        *g = None;
+                        break st.success();
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        *g = None;
+                        break false;
+                    }
+                }
+                drop(g);
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            *e.login_stdin.lock().unwrap() = None;
+            if e.state().login.as_ref().map(|l| l.id.as_str()) != Some(id2.as_str()) {
+                return;
+            }
+            let text = out.lock().unwrap().clone();
+            let u = remote::parse_usage(&text);
+            if !ok || u.balance.is_none() {
+                let why = if text.contains("invalid_grant") || text.contains("Malformed") {
+                    "授权码不对或已过期，重新打开登录页再试".to_string()
+                } else {
+                    remote::last_lines(&text, 2)
+                };
+                e.edit(|s| {
+                    if let Some(lg) = s.login.as_mut() {
+                        lg.busy = false;
+                        lg.error = Some(if why.is_empty() { "登录没有成功".into() } else { why });
+                    }
+                });
+                if !existing {
+                    remote::forget(&id2);
+                }
+                return;
+            }
+            let email = remote::whoami(&id2).unwrap_or_default();
+            // 同一个 Google 账号加了两次
+            if !existing {
+                if let Some(dup) = e.accounts().into_iter().find(|a| !email.is_empty() && a.email.eq_ignore_ascii_case(&email)) {
+                    remote::forget(&id2);
+                    e.edit(|s| {
+                        if let Some(lg) = s.login.as_mut() {
+                            lg.busy = false;
+                            lg.error = Some(format!("这个 Google 账号已经添加过了（{}）", dup.name));
+                        }
+                    });
+                    return;
+                }
+            }
+            let acct = Account {
+                id: id2.clone(),
+                name: name.clone(),
+                email,
+                balance: u.balance,
+                rate: u.rate,
+                checked: now_secs() as u64,
+                error: None,
+            };
+            let list = {
+                let mut s = e.st.lock().unwrap();
+                match s.accounts.iter_mut().find(|a| a.id == id2) {
+                    Some(a) => *a = Account { name: a.name.clone(), email: if acct.email.is_empty() { a.email.clone() } else { acct.email.clone() }, ..acct.clone() },
+                    None => s.accounts.push(acct.clone()),
+                }
+                s.login = None;
+                s.version += 1;
+                s.accounts.clone()
+            };
+            accounts::save(&list);
+            if remote::account() == id2 {
+                e.refresh_usage();
+                if matches!(e.state().phase(), Phase::Failed(_)) {
+                    e.check_existing();
+                }
+            }
+            e.notify(format!("{}：{} 登录成功，余额 {:.1} CU", if existing { "重新登录" } else { "已添加账号" }, acct.name, acct.balance.unwrap_or(0.0)), false);
+        });
+        Ok(id)
+    }
+
+    /// 提交浏览器里拿到的授权码
+    pub fn login_code(&self, code: &str) -> anyhow::Result<()> {
+        let code = code.trim();
+        if code.is_empty() || code.contains(char::is_whitespace) {
+            anyhow::bail!("授权码不对");
+        }
+        let mut g = self.login_stdin.lock().unwrap();
+        let Some(mut w) = g.take() else { anyhow::bail!("没有在等授权码的登录") };
+        w.write_all(format!("{code}\n").as_bytes())?;
+        w.flush()?;
+        drop(w);
+        self.edit(|s| {
+            if let Some(lg) = s.login.as_mut() {
+                lg.busy = true;
+                lg.error = None;
+            }
+        });
+        Ok(())
+    }
+
+    pub fn login_cancel(&self) {
+        if let Some(mut c) = self.login_child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        *self.login_stdin.lock().unwrap() = None;
+        let l = self.state().login.take();
+        if let Some(l) = l {
+            if !l.existing {
+                remote::forget(&l.id);
+            }
+            self.edit(|_| {});
         }
     }
 

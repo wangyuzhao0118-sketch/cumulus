@@ -1,3 +1,4 @@
+mod accounts;
 #[allow(dead_code)]
 mod anim;
 mod cli;
@@ -86,6 +87,8 @@ struct Inputs {
     dl_url: Entity<TextInput>,
     dl_name: Entity<TextInput>,
     profile_name: Entity<TextInput>,
+    account_name: Entity<TextInput>,
+    login_code: Entity<TextInput>,
 }
 
 struct Notice {
@@ -116,6 +119,10 @@ struct Cumulus {
     wf_open: bool,
     /// 切换方案会删掉 SSD 上的模型时，先问一下
     confirm_profile: Option<String>,
+    /// 删除账号前先问一下（账号 id）
+    confirm_account_rm: Option<String>,
+    /// 已经替用户在浏览器里打开过登录页的那次登录（账号 id）
+    login_opened: Option<String>,
     comfy_log_tab: bool,
     log_scroll: UniformListScrollHandle,
     log_follow: bool,
@@ -243,6 +250,8 @@ impl Cumulus {
             dl_url: mk("粘贴 Hugging Face / Civitai / 直链地址", "", cx),
             dl_name: mk("文件名（可选，默认自动识别）", "", cx),
             profile_name: mk("方案名，如「视频 Wan」", "", cx),
+            account_name: mk("新账号的名字，如「副号」", "", cx),
+            login_code: mk("粘贴授权码", "", cx),
         };
         // 定时看一下引擎状态有没有变化；开机中、运行中每秒刷新一次（倒计时、计时器）
         let ticker = cx.spawn(async move |this, cx| {
@@ -267,6 +276,8 @@ impl Cumulus {
             confirm_delete: None,
             wf_open: false,
             confirm_profile: None,
+            confirm_account_rm: None,
+            login_opened: None,
             comfy_log_tab: false,
             log_scroll: UniformListScrollHandle::new(),
             log_follow: true,
@@ -286,6 +297,14 @@ impl Cumulus {
         };
         for (t, e) in notices {
             self.toast(t, e);
+        }
+        // 登录地址出来了：替用户在浏览器里打开一次
+        let login_url = self.engine.state().login.as_ref().and_then(|l| Some((l.id.clone(), l.url.clone()?)));
+        if let Some((id, url)) = login_url {
+            if self.login_opened.as_deref() != Some(id.as_str()) {
+                self.login_opened = Some(id);
+                cx.open_url(&url);
+            }
         }
         if ver != self.seen || (second && busy) || self.notice.is_some() {
             if ver != self.seen && self.log_follow && self.page == Page::Logs {
@@ -641,9 +660,11 @@ impl Cumulus {
 
 impl Cumulus {
     fn render_left(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (phase, hw, bal) = {
+        let active = remote::account();
+        let (phase, hw, bal, acct) = {
             let s = self.engine.state();
-            (s.phase(), s.hardware.clone(), s.usage.balance)
+            let acct = (s.accounts.len() > 1).then(|| s.accounts.iter().find(|a| a.id == active).map(|a| a.name.clone())).flatten();
+            (s.phase(), s.hardware.clone(), s.usage.balance, acct)
         };
         div()
             .w(px(LEFT_W))
@@ -693,7 +714,8 @@ impl Cumulus {
                     .child(label(match bal {
                         Some(b) => format!("CU 余额 {b:.1}"),
                         None => "CU 余额 —".into(),
-                    })),
+                    }))
+                    .when_some(acct, |d, a| d.child(label(format!("账号：{a}")))),
             )
     }
 
@@ -818,10 +840,34 @@ impl Cumulus {
                 _ => "没有 GPU，只适合测试",
             }).ml_2());
 
+        let active = remote::account();
+        let acct_row = (s.accounts.len() > 1).then(|| {
+            div().flex().items_center().gap_1p5().flex_wrap()
+                .child(label("账号").mr_1())
+                .children(s.accounts.iter().map(|a| {
+                    let on = a.id == active;
+                    let id = a.id.clone();
+                    let text = match a.balance {
+                        Some(b) => format!("{} · {b:.1} CU", a.name),
+                        None => format!("{} · —", a.name),
+                    };
+                    chip(SharedString::from(format!("acct-{}", a.id)), text, on, !busy || on).when(!busy && !on, |d| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            if let Err(e) = this.engine.account_use(&id) {
+                                this.toast(e.to_string(), true);
+                            }
+                            cx.notify();
+                        }))
+                    })
+                }))
+                .child(label(if busy { "关机后才能换账号" } else { "点一下换成这个账号开机" }).ml_2())
+        });
+
         let head = card()
             .gap_4()
             .child(div().flex().items_center().gap_4().child(status).child(actions))
-            .child(gpu_row);
+            .child(gpu_row)
+            .children(acct_row);
 
         // ---- 开机步骤
         let show_steps = !matches!(phase, Phase::Off | Phase::Checking) || !s.steps_done.is_empty();
@@ -1449,11 +1495,12 @@ impl Cumulus {
             .gap_2()
             .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Colab 命令行"))
             .child(label(if colab_ok {
-                format!("使用 {}。账号登录信息由它保存（~/.config/colab-cli）。", remote::colab_bin().display())
+                format!("使用 {}。登录信息存在 macOS 钥匙串里（主账号是它自己登录的那个，其他账号见上面「Colab 账号」）。", remote::colab_bin().display())
             } else {
                 "没有找到 colab 命令。在终端运行：uv tool install google-colab-cli，然后运行一次 colab sessions 登录。".to_string()
             }))
             .child(label(format!("ssh 专用密钥：{}", remote::key_path().display())));
+        let accounts_card = self.render_accounts(cx);
         div()
             .id("settings")
             .size_full()
@@ -1462,6 +1509,7 @@ impl Cumulus {
             .flex()
             .flex_col()
             .gap_4()
+            .child(accounts_card)
             .child(
                 card()
                     .child(div().text_sm().font_weight(FontWeight::MEDIUM).pb_2().child("Google Drive"))
@@ -1495,6 +1543,180 @@ impl Cumulus {
             .child(colab_card)
             .child(div().flex().justify_end().pb_4().child(primary("save", "保存设置", theme::accent()).on_click(cx.listener(|this, _, _, cx| this.save_settings(cx)))))
             .into_any_element()
+    }
+
+    /// 设置页的「Colab 账号」：每个账号的余额、换账号、加账号（登录）、重新登录、改名、删除
+    fn render_accounts(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let active = remote::account();
+        let (list, busy, refreshing, login) = {
+            let s = self.engine.state();
+            (s.accounts.clone(), s.phase().busy(), s.accounts_busy, s.login.clone())
+        };
+        let total: f32 = list.iter().filter_map(|a| a.balance).sum();
+        let rows = list.iter().map(|a| {
+            let on = a.id == active;
+            let (id1, id2, id3, id4) = (a.id.clone(), a.id.clone(), a.id.clone(), a.id.clone());
+            let confirming = self.confirm_account_rm.as_deref() == Some(a.id.as_str());
+            let sub = if a.email.is_empty() {
+                if a.id == remote::DEFAULT_ACCOUNT { "colab 命令行登录的账号".to_string() } else { String::new() }
+            } else {
+                a.email.clone()
+            };
+            let when = a.error.clone().unwrap_or_else(|| a.checked_ago());
+            let mut btns = div().flex().items_center().gap_1p5().flex_shrink_0();
+            if confirming {
+                btns = btns
+                    .child(label("删除后要重新登录才能再用").mr_1())
+                    .child(button(SharedString::from(format!("acct-rm-yes-{}", a.id)), "确定删除", true).text_color(theme::bad()).on_click(cx.listener(move |this, _, _, cx| {
+                        this.confirm_account_rm = None;
+                        match this.engine.account_remove(&id1) {
+                            Ok(()) => this.toast("已删除账号", false),
+                            Err(e) => this.toast(e.to_string(), true),
+                        }
+                        cx.notify();
+                    })))
+                    .child(button(SharedString::from(format!("acct-rm-no-{}", a.id)), "取消", true).on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm_account_rm = None;
+                        cx.notify();
+                    })));
+            } else {
+                if !on {
+                    btns = btns.child(button(SharedString::from(format!("acct-use-{}", a.id)), "用这个", !busy).when(!busy, |d| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            match this.engine.account_use(&id2) {
+                                Ok(()) => this.toast("已换账号", false),
+                                Err(e) => this.toast(e.to_string(), true),
+                            }
+                            cx.notify();
+                        }))
+                    }));
+                }
+                if a.id != remote::DEFAULT_ACCOUNT {
+                    btns = btns
+                        .child(button(SharedString::from(format!("acct-login-{}", a.id)), "重新登录", login.is_none()).when(login.is_none(), |d| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                if let Err(e) = this.engine.login_start(Some(&id3), "") {
+                                    this.toast(e.to_string(), true);
+                                }
+                                cx.notify();
+                            }))
+                        }))
+                        .when(!on, |d| {
+                            d.child(button(SharedString::from(format!("acct-rm-{}", a.id)), "删除", true).on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm_account_rm = Some(id4.clone());
+                                cx.notify();
+                            })))
+                        });
+                }
+            }
+            div().flex().items_center().gap_3().py_2p5().border_t_1().border_color(theme::border())
+                .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(if on { theme::ok() } else { theme::track() }))
+                .child(
+                    div().flex_1().min_w(px(0.)).flex().flex_col().gap_0p5()
+                        .child(div().flex().items_center().gap_2().text_sm()
+                            .child(a.name.clone())
+                            .when(on, |d| d.child(div().text_xs().text_color(theme::ok()).child("开机用这个"))))
+                        .when(!sub.is_empty(), |d| d.child(label(sub))),
+                )
+                .child(
+                    div().w(px(150.)).flex_shrink_0().flex().flex_col().items_end().gap_0p5()
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(a.balance.map(|b| format!("{b:.1} CU")).unwrap_or("—".into())))
+                        .child(div().text_xs().text_color(if a.error.is_some() { theme::bad() } else { theme::faint() }).child(when)),
+                )
+                .child(btns)
+        }).collect::<Vec<_>>();
+
+        // 登录面板
+        let login_panel = login.map(|l| {
+            let mut p = div().mt_2().p_3().rounded_md().border_1().border_color(if l.error.is_some() { theme::bad() } else { theme::warn() }).flex().flex_col().gap_2()
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(format!("{}：{}", if l.existing { "重新登录" } else { "添加账号" }, l.name)));
+            if let Some(err) = &l.error {
+                let (id, name, existing) = (l.id.clone(), l.name.clone(), l.existing);
+                p = p.child(div().text_xs().text_color(theme::bad()).child(err.clone())).child(
+                    div().flex().gap_2()
+                        .child(primary("login-retry", "再试一次", theme::accent()).on_click(cx.listener(move |this, _, _, cx| {
+                            this.login_opened = None;
+                            let r = if existing { this.engine.login_start(Some(&id), "") } else { this.engine.login_start(None, &name) };
+                            if let Err(e) = r {
+                                this.toast(e.to_string(), true);
+                            }
+                            cx.notify();
+                        })))
+                        .child(button("login-cancel", "取消", true).on_click(cx.listener(|this, _, _, cx| {
+                            this.engine.login_cancel();
+                            cx.notify();
+                        }))),
+                );
+            } else if l.busy {
+                p = p.child(label("正在验证授权码…"));
+            } else if let Some(url) = l.url.clone() {
+                let u2 = url.clone();
+                p = p
+                    .child(div().text_xs().text_color(theme::muted()).child(
+                        "已经在浏览器里打开了 Google 登录页：选要添加的那个 Google 账号，点「允许」。页面上会显示一串授权码，复制后粘贴到下面。",
+                    ))
+                    .child(
+                        div().flex().items_center().gap_2()
+                            .child(div().flex_1().min_w(px(0.)).child(self.inputs.login_code.clone()))
+                            .child(primary("login-submit", "提交", theme::accent()).on_click(cx.listener(|this, _, _, cx| {
+                                let code = this.inputs.login_code.read(cx).text().trim().to_string();
+                                match this.engine.login_code(&code) {
+                                    Ok(()) => this.inputs.login_code.update(cx, |t, cx| t.set_text("", None, cx)),
+                                    Err(e) => this.toast(e.to_string(), true),
+                                }
+                                cx.notify();
+                            }))),
+                    )
+                    .child(
+                        div().flex().gap_2()
+                            .child(button("login-open", "重新打开登录页", true).on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))))
+                            .child(button("login-copy", "复制地址", true).on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(u2.clone()));
+                                this.toast("已复制", false);
+                            })))
+                            .child(button("login-cancel", "取消", true).on_click(cx.listener(|this, _, _, cx| {
+                                this.engine.login_cancel();
+                                cx.notify();
+                            }))),
+                    );
+            } else {
+                p = p.child(label("正在准备登录…"));
+            }
+            p
+        });
+
+        let can_add = self.engine.state().login.is_none();
+        card()
+            .child(
+                div().flex().items_center().gap_2().pb_2()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Colab 账号"))
+                    .when(list.len() > 1, |d| d.child(label(format!("合计 {total:.1} CU"))))
+                    .child(div().flex_1())
+                    .child(button("acct-refresh", if refreshing { "正在查…" } else { "刷新余额" }, !refreshing).when(!refreshing, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.engine.refresh_accounts();
+                            cx.notify();
+                        }))
+                    })),
+            )
+            .child(label("开机、挂 Drive、扣 CU 都用标着「开机用这个」的账号；其他账号只显示余额（每 15 分钟查一次）。换账号要先关机。").pb_2())
+            .children(rows)
+            .child(
+                div().flex().items_center().gap_2().pt_2p5().border_t_1().border_color(theme::border())
+                    .child(div().flex_1().min_w(px(0.)).child(self.inputs.account_name.clone()))
+                    .child(primary("acct-add", "添加账号", theme::accent()).when(!can_add, |d| d.opacity(0.5)).when(can_add, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            let name = this.inputs.account_name.read(cx).text().trim().to_string();
+                            this.login_opened = None;
+                            match this.engine.login_start(None, &name) {
+                                Ok(_) => this.inputs.account_name.update(cx, |t, cx| t.set_text("", None, cx)),
+                                Err(e) => this.toast(e.to_string(), true),
+                            }
+                            cx.notify();
+                        }))
+                    })),
+            )
+            .children(login_panel)
     }
 
     // ---------------------------------------------------------------- 浮层
@@ -1692,9 +1914,14 @@ fn guard() {
             println!("{log}");
             last = log;
         }
+        // 命令行发起的登录等用户贴授权码：最多等 15 分钟，等着的时候不退出
+        let login_age = engine.state().login.as_ref().map(|l| l.started.map(|t| t.elapsed()).unwrap_or_default());
+        if login_age.is_some_and(|t| t > Duration::from_secs(15 * 60)) {
+            engine.login_cancel();
+        }
         if matches!(phase, Phase::Off | Phase::Failed(_)) {
             let since = *off_since.get_or_insert_with(Instant::now);
-            if since.elapsed() > Duration::from_secs(120) && control::idle_secs() > 120 {
+            if since.elapsed() > Duration::from_secs(120) && control::idle_secs() > 120 && login_age.is_none() {
                 println!("结束：{}", phase.label());
                 engine.shutdown_local();
                 let _ = std::fs::remove_file(&pidf);
@@ -1918,6 +2145,7 @@ fn main() {
         eprintln!("控制接口没有启动：{e}");
     }
     engine.check_existing();
+    engine.start_account_poller();
     let start_page = args.iter().position(|a| a == "--page").and_then(|i| args.get(i + 1)).map(|s| Page::from_key(s));
 
     Application::new().run(move |cx: &mut App| {

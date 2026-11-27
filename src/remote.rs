@@ -38,10 +38,138 @@ pub fn colab_installed() -> bool {
     colab_bin().exists()
 }
 
+// ------------------------------------------------------------------ 多账号
+//
+// colab CLI 只在 macOS 钥匙串里存一份令牌（google-colab-cli / oauth_token）。给它的 Python 换一个
+// 钥匙串后端（kit/cumulus_keyring.py）：令牌照样存在钥匙串里，只是按 CUMULUS_ACCOUNT 分开条目；
+// default 账号就是原来那一条，不受影响。会话状态文件（哪个会话连哪台 VM）也按账号分开（--config）。
+
+const KEYRING_PY: &str = include_str!("../kit/cumulus_keyring.py");
+const WHOAMI_PY: &str = include_str!("../kit/whoami.py");
+pub const DEFAULT_ACCOUNT: &str = "default";
+
+/// 开机、查会话等用的账号
+static ACCOUNT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn set_account(id: &str) {
+    *ACCOUNT.lock().unwrap() = id.to_string();
+}
+
+pub fn account() -> String {
+    let a = ACCOUNT.lock().unwrap().clone();
+    if a.is_empty() { DEFAULT_ACCOUNT.into() } else { a }
+}
+
+/// 放钥匙串后端和小脚本的目录（每次启动写一次，内容跟着程序版本走）
+fn pykit() -> PathBuf {
+    static DONE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| {
+        let d = crate::config::dir().join("pykit");
+        let _ = std::fs::create_dir_all(&d);
+        for (name, text) in [("cumulus_keyring.py", KEYRING_PY), ("whoami.py", WHOAMI_PY)] {
+            let p = d.join(name);
+            if std::fs::read_to_string(&p).ok().as_deref() != Some(text) {
+                let _ = std::fs::write(&p, text);
+            }
+        }
+        d
+    })
+    .clone()
+}
+
+/// 这个账号的会话状态文件（default 用 colab CLI 默认的那个）
+fn sessions_file(acct: &str) -> Option<PathBuf> {
+    if acct == DEFAULT_ACCOUNT {
+        return None;
+    }
+    let d = crate::config::dir().join("accounts").join(acct);
+    let _ = std::fs::create_dir_all(&d);
+    Some(d.join("sessions.json"))
+}
+
+/// 让 colab（以及 ssh 的 ProxyCommand 里的 colab）用这个账号的令牌
+fn account_env(c: &mut Command, acct: &str) {
+    c.env("PYTHONPATH", pykit())
+        .env("PYTHON_KEYRING_BACKEND", "cumulus_keyring.Keyring")
+        .env("CUMULUS_ACCOUNT", acct);
+}
+
 fn colab() -> Command {
+    colab_as(&account())
+}
+
+fn colab_as(acct: &str) -> Command {
     let mut c = Command::new(colab_bin());
     c.env("NO_COLOR", "1").env("COLUMNS", "200").env("TERM", "dumb");
+    account_env(&mut c, acct);
+    if let Some(f) = sessions_file(acct) {
+        c.arg("--config").arg(f);
+    }
     c
+}
+
+/// 某个账号的 CU 余额（不影响当前开机用的账号）
+pub fn usage_of(acct: &str) -> Result<Usage> {
+    let mut child = colab_as(acct)
+        .arg("usage")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("无法运行 {}", colab_bin().display()))?;
+    let (ok, text) = wait_output(&mut child, Duration::from_secs(60))?;
+    let text = strip_ansi(&text);
+    let u = parse_usage(&text);
+    if u.balance.is_none() {
+        if text.contains("authorization code") || text.contains("EOF when reading") {
+            bail!("需要重新登录");
+        }
+        bail!("{}", if ok { "没有读到余额".to_string() } else { last_lines(&text, 2) });
+    }
+    Ok(u)
+}
+
+/// 登录一个账号：跑 `colab usage`，它会在 stderr 打印授权地址并等输入授权码；
+/// 调用方读出地址给用户，用户贴回授权码后写进 stdin，成功后令牌存进钥匙串，输出里有余额
+pub fn login(acct: &str) -> Result<Child> {
+    colab_as(acct)
+        .arg("usage")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("无法运行 {}", colab_bin().display()))
+}
+
+/// 账号的 Google 邮箱（用 colab CLI 自己的 Python 和令牌查）
+pub fn whoami(acct: &str) -> Result<String> {
+    let bin = colab_bin();
+    let first = std::fs::read_to_string(&bin).ok().and_then(|t| t.lines().next().map(str::to_string)).unwrap_or_default();
+    let py = first.strip_prefix("#!").map(str::trim).filter(|p| p.starts_with('/') && !p.contains(' ')).ok_or_else(|| anyhow!("找不到 colab 用的 Python"))?;
+    let mut c = Command::new(py);
+    account_env(&mut c, acct);
+    let mut child = c.arg(pykit().join("whoami.py")).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let (ok, text) = wait_output(&mut child, Duration::from_secs(60))?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("@@EMAIL ").map(|e| e.trim().to_string()))
+        .filter(|e| ok && !e.is_empty())
+        .ok_or_else(|| anyhow!("查不到邮箱：{}", last_lines(&strip_ansi(&text), 2)))
+}
+
+/// 删掉某个账号在钥匙串里的令牌和会话状态（default 不能删）
+pub fn forget(acct: &str) {
+    if acct == DEFAULT_ACCOUNT || acct.is_empty() {
+        return;
+    }
+    // 条目名和 kit/cumulus_keyring.py 里的一致
+    let _ = Command::new("/usr/bin/security")
+        .args(["delete-generic-password", "-s", "google-colab-cli", "-a"])
+        .arg(format!("oauth_token@cumulus:{acct}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = std::fs::remove_dir_all(crate::config::dir().join("accounts").join(acct));
 }
 
 /// 去掉 rich 输出里的颜色控制符
@@ -267,6 +395,8 @@ pub struct Ssh {
     pub session: String,
     pub sock: PathBuf,
     key: PathBuf,
+    /// 开这台 VM 的账号（ProxyCommand 里的 colab ssh 要用它的令牌和会话状态）
+    acct: String,
 }
 
 impl Ssh {
@@ -274,13 +404,14 @@ impl Ssh {
         let key = ensure_key()?;
         // unix socket 路径有长度限制，放 /tmp
         let sock = PathBuf::from(format!("/tmp/cumulus-{}.sock", session.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()));
-        Ok(Ssh { session: session.into(), sock, key })
+        Ok(Ssh { session: session.into(), sock, key, acct: account() })
     }
 
     fn base(&self) -> Command {
         let mut c = Command::new("/usr/bin/ssh");
+        let config = sessions_file(&self.acct).map(|f| format!(" --config {}", sh_quote(&f.to_string_lossy()))).unwrap_or_default();
         let proxy = format!(
-            "{} ssh --proxy-mode -s {} -i {}",
+            "{}{config} ssh --proxy-mode -s {} -i {}",
             sh_quote(&colab_bin().to_string_lossy()),
             sh_quote(&self.session),
             sh_quote(&self.key.to_string_lossy())
@@ -295,6 +426,7 @@ impl Ssh {
             .arg("-S")
             .arg(&self.sock)
             .env("NO_COLOR", "1");
+        account_env(&mut c, &self.acct);
         c
     }
 

@@ -13,7 +13,7 @@ use crate::remote::{self, fmt_bytes, fmt_duration};
 
 pub const COMMANDS: &[&str] = &[
     "status", "up", "down", "drive-continue", "extend", "logs", "models", "download", "ssd", "tasks", "cancel", "rm-model", "outputs", "run", "workflows",
-    "interrupt", "exec", "config", "help",
+    "interrupt", "exec", "config", "account", "accounts", "help",
 ];
 
 const HELP: &str = "\
@@ -60,6 +60,17 @@ Cumulus 命令行 —— 在 Google Colab 上跑 ComfyUI
   rm-model <键> --yes        从 Drive 删除模型（进 Drive 回收站）
   tasks                      下载 / 复制任务；cancel <编号> 取消
   workflows                  ComfyUI 里保存的工作流（接了 Drive 就在 Drive 的 workflows/ 下）
+
+Colab 账号（可以加好几个，各自的 CU 余额都能看）
+  account [--refresh]        账号和 CU 余额，* 是开机用的；--refresh 现在去查一遍
+  account use <名字>         换开机用的账号（要先关机）
+  account add <名字>         添加账号：打印 Google 登录地址，用户在浏览器登录后会拿到授权码；
+                             在终端里直接粘贴，或运行 cumulus account code <授权码>
+  account code <授权码>      提交授权码，完成登录
+  account login <名字>       令牌失效时重新登录
+  account rename <名字> <新名字>
+  account rm <名字> --yes    删除账号（钥匙串里的令牌一起删）
+  account cancel             取消正在进行的登录
 
 其他
   exec <命令...>             在 VM 上执行 shell 命令（复用已有连接），退出码原样返回
@@ -221,6 +232,7 @@ fn run_cmd(cmd: &str, a: &Args) -> Result<i32> {
             Ok(0)
         }
         "config" => config(a),
+        "account" | "accounts" => account(a),
         _ => bail!("不认识的命令：{cmd}"),
     }
 }
@@ -269,7 +281,8 @@ fn status_text(v: &Value) -> String {
     }
     if let Some(b) = v["cu"]["balance"].as_f64() {
         let rate = v["cu"]["rate_per_hour"].as_f64().map(|r| format!("，每小时 {r:.2}")).unwrap_or_default();
-        o.push(format!("CU 余额：{b:.1}{rate}"));
+        let who = v["account"]["name"].as_str().map(|n| format!("（账号 {n}）")).unwrap_or_default();
+        o.push(format!("CU 余额：{b:.1}{rate}{who}"));
     }
     if let Some(g) = v["gpu"].as_object() {
         let f = |k: &str| g.get(k).and_then(Value::as_f64).unwrap_or(0.0);
@@ -563,6 +576,94 @@ fn budget_text(b: &Value) -> String {
         None => t.push_str("，这种 GPU 的 SSD 容量还没量过（开一次机就知道）"),
     }
     t
+}
+
+fn accounts_text(v: &Value) -> String {
+    let list = v["accounts"].as_array().cloned().unwrap_or_default();
+    let mut out: Vec<String> = list
+        .iter()
+        .map(|x| {
+            let bal = x["balance"].as_f64().map(|b| format!("{b:.1} CU")).unwrap_or("—".into());
+            let ago = crate::accounts::Account { checked: x["checked"].as_u64().unwrap_or(0), ..Default::default() }.checked_ago();
+            let note = format!("（{}）", x["error"].as_str().map(String::from).unwrap_or(ago));
+            let email = x["email"].as_str().filter(|e| !e.is_empty()).map(|e| format!("  {e}")).unwrap_or_default();
+            format!("{}{:<12} {:>10} {note}{email}", if x["active"] == true { "* " } else { "  " }, x["name"].as_str().unwrap_or(""), bal)
+        })
+        .collect();
+    if list.len() > 1 {
+        out.push(format!("  合计 {:.1} CU", v["total_balance"].as_f64().unwrap_or(0.0)));
+    }
+    out.join("\n")
+}
+
+fn account(a: &Args) -> Result<i32> {
+    let sub = a.pos.first().map(String::as_str).unwrap_or("list");
+    let arg = |i: usize, usage: &str| a.pos.get(i).cloned().ok_or_else(|| anyhow!("用法：cumulus account {usage}"));
+    match sub {
+        "list" => {
+            if a.refresh && !a.json {
+                eprintln!("正在查每个账号的余额…");
+            }
+            let v = call(json!({"cmd": "accounts", "refresh": a.refresh}))?;
+            emit(a, &v, || accounts_text(&v));
+            Ok(0)
+        }
+        "use" => {
+            let k = arg(1, "use <名字>")?;
+            let v = call(json!({"cmd": "account_use", "account": k}))?;
+            emit(a, &v, || format!("开机改用账号「{k}」\n{}", accounts_text(&v)));
+            Ok(0)
+        }
+        "rename" => {
+            let (k, n) = (arg(1, "rename <名字> <新名字>")?, arg(2, "rename <名字> <新名字>")?);
+            let v = call(json!({"cmd": "account_rename", "account": k, "name": n}))?;
+            emit(a, &v, || format!("已改名为「{n}」"));
+            Ok(0)
+        }
+        "rm" => {
+            let k = arg(1, "rm <名字> --yes")?;
+            if !a.yes {
+                bail!("会删除账号「{k}」和它在钥匙串里的登录信息，确认的话加 --yes");
+            }
+            let v = call(json!({"cmd": "account_rm", "account": k}))?;
+            emit(a, &v, || format!("已删除账号「{k}」"));
+            Ok(0)
+        }
+        "add" | "login" => {
+            let k = arg(1, &format!("{sub} <名字>"))?;
+            let req = if sub == "add" { json!({"cmd": "account_add", "name": k}) } else { json!({"cmd": "account_login", "account": k}) };
+            let v = call(req)?;
+            let url = v["url"].as_str().unwrap_or("");
+            if a.json {
+                println!("{v}");
+                return Ok(0);
+            }
+            eprintln!("在浏览器里打开下面的地址，选要{}的 Google 账号并点「允许」，页面上会显示授权码：\n\n  {url}\n", if sub == "add" { "添加" } else { "登录" });
+            if !std::io::stdin().is_terminal() {
+                eprintln!("拿到授权码后运行：cumulus account code <授权码>");
+                return Ok(0);
+            }
+            eprint!("粘贴授权码后回车（直接回车取消）：");
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            let code = code.trim();
+            if code.is_empty() {
+                call(json!({"cmd": "account_cancel"}))?;
+                bail!("已取消");
+            }
+            let v = call(json!({"cmd": "account_code", "code": code}))?;
+            println!("登录成功\n{}", accounts_text(&v));
+            Ok(0)
+        }
+        "code" => {
+            let c = arg(1, "code <授权码>")?;
+            let v = call(json!({"cmd": "account_code", "code": c}))?;
+            emit(a, &v, || format!("登录成功\n{}", accounts_text(&v)));
+            Ok(0)
+        }
+        "cancel" => simple(a, json!({"cmd": "account_cancel"}), "已取消登录"),
+        _ => bail!("用法：cumulus account [list|use|add|code|login|rename|rm|cancel]"),
+    }
 }
 
 fn ssd_profile(a: &Args) -> Result<i32> {

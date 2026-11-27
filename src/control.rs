@@ -407,6 +407,58 @@ fn dispatch(e: &Engine, req: &Value) -> Result<Value> {
             e.set_config(c.clone());
             Ok(config_json(&c))
         }
+        "accounts" => {
+            if req.get("refresh").and_then(Value::as_bool).unwrap_or(false) {
+                e.refresh_accounts();
+                wait_until(Duration::from_secs(120), || !e.state().accounts_busy);
+            }
+            Ok(accounts_json(e))
+        }
+        "account_use" => {
+            let a = account_arg(e, req)?;
+            e.account_use(&a.id)?;
+            Ok(accounts_json(e))
+        }
+        "account_rename" => {
+            let a = account_arg(e, req)?;
+            e.account_rename(&a.id, str_arg(req, "name")?)?;
+            Ok(accounts_json(e))
+        }
+        "account_rm" => {
+            let a = account_arg(e, req)?;
+            e.account_remove(&a.id)?;
+            Ok(accounts_json(e))
+        }
+        // 开始登录（新加账号给 name，重新登录给 account），等授权地址出来再返回
+        "account_add" | "account_login" => {
+            let id = if cmd == "account_add" {
+                e.login_start(None, str_arg(req, "name")?)?
+            } else {
+                let a = account_arg(e, req)?;
+                e.login_start(Some(&a.id), "")?
+            };
+            wait_until(Duration::from_secs(60), || e.state().login.as_ref().is_none_or(|l| l.url.is_some() || l.error.is_some()));
+            let l = e.state().login.clone();
+            match l {
+                Some(l) if l.id == id && l.url.is_some() => Ok(json!({"id": id, "url": l.url})),
+                Some(l) if l.error.is_some() => bail!("{}", l.error.unwrap_or_default()),
+                _ => bail!("没有拿到登录地址"),
+            }
+        }
+        // 提交授权码，等登录结果
+        "account_code" => {
+            e.login_code(str_arg(req, "code")?)?;
+            wait_until(Duration::from_secs(90), || e.state().login.as_ref().is_none_or(|l| !l.busy));
+            let l = e.state().login.clone();
+            match l {
+                None => Ok(accounts_json(e)),
+                Some(l) => bail!("{}", l.error.unwrap_or_else(|| "登录还没完成".into())),
+            }
+        }
+        "account_cancel" => {
+            e.login_cancel();
+            Ok(json!({}))
+        }
         "" => bail!("缺少 cmd"),
         other => bail!("不认识的命令：{other}"),
     }
@@ -426,6 +478,31 @@ fn workflow_text(e: &Engine, req: &Value) -> Result<Option<String>> {
         .find(|x| *x == n || *x == format!("{n}.json") || base(x) == n || base(x) == format!("{n}.json"))
         .ok_or_else(|| anyhow!("ComfyUI 里没有叫 {n} 的工作流（cumulus workflows 查看）"))?;
     Ok(Some(e.read_workflow(&pick)?))
+}
+
+fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !done() && t.elapsed() < limit {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// 请求里的账号：id、名字或邮箱
+fn account_arg(e: &Engine, req: &Value) -> Result<crate::accounts::Account> {
+    let k = str_arg(req, "account")?;
+    let list = e.accounts();
+    crate::accounts::find(&list, k).cloned().ok_or_else(|| anyhow!("没有叫「{k}」的账号（cumulus account 查看）"))
+}
+
+fn accounts_json(e: &Engine) -> Value {
+    let active = crate::remote::account();
+    let s = e.state();
+    json!({
+        "accounts": crate::accounts::to_json(&s.accounts, &active),
+        "active": active,
+        "total_balance": s.accounts.iter().filter_map(|a| a.balance).sum::<f32>(),
+        "login": s.login.as_ref().map(|l| json!({"id": l.id, "name": l.name, "url": l.url, "busy": l.busy, "error": l.error})),
+    })
 }
 
 fn budget_json(b: &crate::engine::Budget) -> Value {
@@ -482,6 +559,7 @@ fn status(e: &Engine) -> Value {
         "idle_shutdown_in_s": opt_secs(idle),
         "max_shutdown_in_s": opt_secs(max),
         "cu": {"balance": s.usage.balance, "rate_per_hour": s.usage.rate},
+        "account": s.accounts.iter().find(|a| a.id == crate::remote::account()).map(|a| json!({"id": a.id, "name": a.name, "email": a.email})),
         "gpu": s.gpu.as_ref().map(|g| json!({"name": g.name, "util": g.util, "mem_used_mb": g.mem_used, "mem_total_mb": g.mem_total, "temp_c": g.temp, "power_w": g.power})),
         "mem": {"used": s.mem.0, "total": s.mem.1},
         "disk": {"used": s.disk.0, "total": s.disk.1},
@@ -522,7 +600,8 @@ fn tasks(e: &Engine) -> Vec<Value> {
 
 /// 方案和测出来的空间由专门的命令管，不走 config get/set
 fn internal_key(k: &str) -> bool {
-    k.starts_with("ssd_profile.") || k == "ssd_room"
+    // 账号用 account use 换（要检查是不是关机状态、重新查会话）
+    k.starts_with("ssd_profile.") || k == "ssd_room" || k == "account"
 }
 
 /// 设置项：令牌不回传，只说有没有设

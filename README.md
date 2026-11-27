@@ -49,6 +49,9 @@ cumulus ssd profile save 视频 --from wan_t2v   # 把一个工作流用到的�
 cumulus ssd profile use 视频         # 整组换上：SSD 上只留方案里的模型
 cumulus exec nvidia-smi             # 在 VM 上执行命令（复用已有连接）
 cumulus config set idle_min 20      # 修改设置
+cumulus account --refresh           # 每个 Colab 账号的 CU 余额，* 是开机用的
+cumulus account add 副号             # 添加账号（打印 Google 登录地址，粘贴授权码完成登录）
+cumulus account use 副号             # 换开机用的账号（要先关机）
 cumulus down                        # 同步出图后关机
 ```
 
@@ -81,6 +84,7 @@ cumulus down                        # 同步出图后关机
 - **按工作流导入 SSD**：「本地 SSD 加速」卡片上点「从工作流导入…」，选 ComfyUI 里保存的工作流（接了 Drive 就在 Drive 的 `workflows/` 下）或本机的 .json 文件，列出它用到的模型：哪些已在 SSD、哪些要复制、Drive 上缺哪些，点一下全部复制（先检查 SSD 空间）。界面格式（包括子图）和 API 格式都支持：整个工作流里找模型文件名（.safetensors / .gguf / .ckpt / .pt / .pth 等），先按完整名字、再按文件名和 Drive 上的模型对上；同名文件在几个类别里都有时，按官方模板里标注的类别选。模板里带下载地址的缺失模型可以直接点「下载」到对应类别。命令行是 `cumulus ssd from <工作流>`。
 - **SSD 方案和容量**：把一组模型存成方案（按工作流分，比如「Qwen 出图」「视频」），点一下整组换上：SSD 上只留方案里的模型，别的删掉腾地方（开着时会先确认），缺的开始复制。可以把当前选择存成方案，也可以在「从工作流导入」里把工作流用到的模型存成方案。每种 GPU 的 VM 上能放多少模型，开机时量出来记在设置里（`ssd_room`），模型大小也记在本机（`models_cache`），所以关机时也能看到「已选 28.5 GB / SSD 可放约 37 GB」、方案放不放得下；放不下会标黄，开着时切换会直接拒绝。
 - **运行时自动复制**（默认开）：ComfyUI 开始跑一个工作流时（不管是在浏览器里点的还是命令行提交的），把它用到、还不在 SSD 上的模型复制过去，这次照旧从 Drive 读，下次加载就快了；SSD 放不下就提示，不复制。`cumulus run` 更进一步：提交前先复制完再跑（`--no-ssd` 跳过）。
+- **多个 Colab 账号**：「设置 → Colab 账号」列出每个账号的 CU 余额（每 15 分钟查一次，可以点「刷新余额」），控制台上点一下换成哪个账号开机（关机状态才能换）。添加账号：起个名字，点「添加账号」，浏览器打开 Google 登录页，选那个账号并允许，把页面上的授权码粘贴回来。colab 命令行自己只存一份令牌（macOS 钥匙串里的 `google-colab-cli / oauth_token`，这就是「主账号」，不受影响）；Cumulus 给它的 Python 换了一个钥匙串后端（`kit/cumulus_keyring.py`），其他账号的令牌照样存在钥匙串里，条目名是 `oauth_token@cumulus:<id>`，会话状态也按账号分开（`accounts/<id>/sessions.json`）。账号名字、邮箱和上次查到的余额存在 `accounts.json`（不含令牌）。删除账号会把它在钥匙串里的令牌一起删掉。开机后挂载 Drive 时，授权页里选的 Google 账号要能看到设置里的 ComfyUI 资料目录。
 - **从旧名字 Nimbus 升级**：第一次打开时把 `~/Library/Application Support/nimbus/` 整个搬到 `cumulus/`（设置、ssh 密钥都保留）；旧设置没写会话名的沿用旧的 `nimbus`，所以能直接接上正在跑的 VM；旧程序留下的 ssh 连接会被清掉。
 - **设置**保存在 `~/Library/Application Support/cumulus/config`（权限 600，里面有令牌）。
 
@@ -91,9 +95,11 @@ cumulus down                        # 同步出图后关机
 - `src/config.rs`：设置
 - `src/main.rs`：界面（控制台、模型、出图、日志、设置）、守护模式、自测
 - `src/cli.rs`、`src/control.rs`：命令行，以及掌管进程上的本机控制接口
+- `src/accounts.rs`：多个 Colab 账号（名字、邮箱、余额）
 - `src/workflow.rs`：从工作流里找出用到的模型，和 Drive 上的模型对上
 - `skills/cumulus/SKILL.md`：给 AI 助手（Claude Code）的使用说明
 - `kit/boot.sh`、`kit/poll.py`、`kit/dl.py`、`kit/cp.py`：在 VM 上执行的脚本（编译时打进程序，每次通过 ssh 送过去）
+- `kit/cumulus_keyring.py`、`kit/whoami.py`：在本机给 colab 命令行用的按账号分开的钥匙串后端、查账号邮箱（编译时打进程序，运行时写到设置目录的 `pykit/`）
 - `src/theme.rs`、`src/anim.rs`、`src/input.rs`：沿用 prj22（Lithium）的主题、动画和输入框
 - `assets/cu.svg` → `tools/make-icon.sh assets/cu.svg` 生成 `assets/AppIcon.icns`（和 Lithium 同一套黑底粗体图标，缩写 Cu = 铜）
 
